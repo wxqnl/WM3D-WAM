@@ -32,6 +32,7 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--resume")
     parser.add_argument("--initialize-from")
+    parser.add_argument("--micro-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=2)
@@ -112,6 +113,7 @@ def main() -> None:
         options = TrainerOptions(
             phase=args.phase,
             max_steps=args.max_steps,
+            micro_batch_size=args.micro_batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             num_workers=args.num_workers,
             prefetch_factor=args.prefetch_factor,

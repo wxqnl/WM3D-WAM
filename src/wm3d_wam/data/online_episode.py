@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-import math
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -619,16 +618,11 @@ def load_online_robot_window(
         stop_s=history_stop_s,
         time_origin_s=anchor_s,
         embodiment_id=source_contract.embodiment_id,
-        max_events=max(
-            1,
-            int(
-                math.ceil(
-                    (history_stop_s - history_start_s)
-                    * float(source_contract.source_hz)
-                )
-            )
-            + 1,
-        ),
+        # The frozen history horizon is exactly 16/5 seconds.  Derive a
+        # source-fixed padded shape with integer arithmetic; using the
+        # recorded floating endpoints here can make identical-rate samples
+        # differ by one slot after ``ceil``.
+        max_events=source_contract.source_hz * 16 // 5 + 1,
     )
     future_actions = _action_events(
         packed=packed,
@@ -636,15 +630,9 @@ def load_online_robot_window(
         start_s=anchor_s,
         stop_s=future_stop_s,
         embodiment_id=source_contract.embodiment_id,
-        max_events=max(
-            1,
-            int(
-                math.ceil(
-                    (future_stop_s - anchor_s) * float(source_contract.source_hz)
-                )
-            )
-            + 1,
-        ),
+        # The future horizon is exactly 8/5 seconds; keep one boundary-jitter
+        # slot without allowing binary floating-point noise to change shape.
+        max_events=source_contract.source_hz * 8 // 5 + 1,
     )
     history_boundary_rows = np.concatenate(
         [

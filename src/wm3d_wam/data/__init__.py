@@ -34,6 +34,7 @@ from .online_dataset import (
     OnlineRobotDataset,
     OnlineTrainingSample,
     build_online_dataloader,
+    collate_online_training_samples,
 )
 from .source_contracts import (
     NormalizationRegistry,
@@ -69,6 +70,7 @@ __all__ = [
     "first_eligible_episode",
     "load_online_robot_window",
     "build_online_dataloader",
+    "collate_online_training_samples",
     "denormalize_action_values",
     "is_v1_eligible_manifest_record",
     "materialize_source_split",

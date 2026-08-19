@@ -121,13 +121,24 @@ class RecoverableHierarchicalSampler(Sampler[WindowRequest]):
         seed: int,
         rank: int,
         world_size: int,
+        micro_batch_size: int = 1,
         start_local_index: int = 0,
         num_local_samples: int | None = None,
     ) -> None:
         if rank < 0 or world_size <= 0 or rank >= world_size:
             raise SourceContractError("invalid distributed sampler rank/world_size")
+        if micro_batch_size <= 0:
+            raise SourceContractError("micro_batch_size must be positive")
         if start_local_index < 0 or (num_local_samples is not None and num_local_samples < 0):
             raise SourceContractError("sampler indices must be non-negative")
+        if start_local_index % int(micro_batch_size):
+            raise SourceContractError(
+                "start_local_index must align to the micro-batch boundary"
+            )
+        if num_local_samples is not None and num_local_samples % int(micro_batch_size):
+            raise SourceContractError(
+                "num_local_samples must contain complete micro-batches"
+            )
         self.episode_counts = {name: int(count) for name, count in episode_counts.items()}
         if not self.episode_counts or any(count <= 0 for count in self.episode_counts.values()):
             raise SourceContractError("every sampled source requires at least one episode")
@@ -152,6 +163,7 @@ class RecoverableHierarchicalSampler(Sampler[WindowRequest]):
         self.seed = int(seed)
         self.rank = int(rank)
         self.world_size = int(world_size)
+        self.micro_batch_size = int(micro_batch_size)
         self.start_local_index = int(start_local_index)
         self.num_local_samples = (
             None if num_local_samples is None else int(num_local_samples)
@@ -173,11 +185,12 @@ class RecoverableHierarchicalSampler(Sampler[WindowRequest]):
         # the same order on every rank. Choose the program and source schema
         # from the rank-independent local optimizer-sample index, then choose
         # episode/window details from the unique global index.
+        route_index = int(local_index) // self.micro_batch_size
         route_seed_sequence = np.random.SeedSequence(
             [
                 self.seed & 0xFFFFFFFF,
-                int(local_index) & 0xFFFFFFFF,
-                int(local_index) >> 32,
+                route_index & 0xFFFFFFFF,
+                route_index >> 32,
                 0x50524F47,
             ]
         )
@@ -245,6 +258,7 @@ class RecoverableHierarchicalSampler(Sampler[WindowRequest]):
             "seed": self.seed,
             "rank": self.rank,
             "world_size": self.world_size,
+            "micro_batch_size": self.micro_batch_size,
             "next_local_index": self.start_local_index + int(committed_local_samples),
         }
 
@@ -255,8 +269,14 @@ class RecoverableHierarchicalSampler(Sampler[WindowRequest]):
         seed: int,
         rank: int,
         world_size: int,
+        micro_batch_size: int = 1,
     ) -> int:
-        expected = {"seed": int(seed), "rank": int(rank), "world_size": int(world_size)}
+        expected = {
+            "seed": int(seed),
+            "rank": int(rank),
+            "world_size": int(world_size),
+            "micro_batch_size": int(micro_batch_size),
+        }
         for name, value in expected.items():
             if int(state.get(name, -1)) != value:
                 raise SourceContractError(
@@ -265,6 +285,8 @@ class RecoverableHierarchicalSampler(Sampler[WindowRequest]):
         next_index = int(state.get("next_local_index", -1))
         if next_index < 0:
             raise SourceContractError("sampler checkpoint has no valid next_local_index")
+        if next_index % int(micro_batch_size):
+            raise SourceContractError("sampler checkpoint cursor is not micro-batch aligned")
         return next_index
 
     def describe_request(self, request: WindowRequest) -> dict[str, object]:

@@ -7,7 +7,7 @@ hidden，也没有用合成数据或派生 geometry cache 替代正式路径。
 ## 1. CPU 合同测试
 
 ```text
-59 passed
+60 passed
 ```
 
 测试覆盖 source contract、split、recorded timestamp、原生 action clock、grouped
@@ -42,7 +42,9 @@ view。program、family、source 和 view bucket 按 local sample index 在各 r
 
 视频统一为 5 Hz、9 帧、1.6 秒。Action 保留 5/10/15/20 Hz 原始时钟；名义
 future event 数为 8/16/24/32。recorded timestamp 的边界抖动可能多保留一个
-合法事件，所以张量容量按 `ceil(duration * source_hz) + 1` 计算。历史 3.2 秒
+合法事件，所以张量容量用冻结的整数 horizon 计算：history 为
+`source_hz * 16 // 5 + 1`，future 为 `source_hz * 8 // 5 + 1`。这避免了浮点
+`ceil` 在数学整数边界上偶发多分配一格。历史 3.2 秒
 最大容量为 65，未来 1.6 秒最大容量为 33，不会把边界事件截断。
 
 MP4 loader 根据 manifest PTS seek 到首个目标之前的 keyframe，只解码覆盖目标
@@ -181,11 +183,38 @@ validation 后成功写入完整 rank-local checkpoint，rank 0 最终峰值为 
 | Stage B main，一个 checkpoint | 91 GiB |
 | Stage C，一个 checkpoint | 91 GiB |
 
-实验结束时 `/data` 可用空间约 1.6 TiB。正式配置每 5,000 步保存并只保留最近
-两个已完成 checkpoint；Stage B warmup 每 1,000 步保存。未完成目录不参与自动
-清理，便于诊断写盘或进程故障。
+实验结束时 `/data` 可用空间约 1.6 TiB。Stage A 正式配置每 1,000 步保存；
+Stage B warmup 每 1,000 步保存；完整 Wan/Action 阶段每 5,000 步保存。每个阶段
+都只保留最近两个已完成 checkpoint。未完成目录不参与自动清理，便于诊断写盘
+或进程故障。
 
-## 7. 结论与边界
+## 7. 七卡 Stage A batch 扩展与正式启动
+
+正式 mesh 为物理 GPU `1,2,3,4,5,6,7`，GPU 0 保持空闲。在相同 effective
+global batch 28 下，先比较两种真实七源配置：
+
+| micro-batch / gradient accumulation | 稳态 step time | 全局吞吐 | PyTorch peak memory |
+|---|---:|---:|---:|
+| 1 / 4 | 5.205 s | 5.379 samples/s | 25.717 GiB |
+| 2 / 2 | 3.049 s | 9.183 samples/s | 33.231 GiB |
+| 4 / 1 | 2.249 s | 12.451 samples/s | 46.059 GiB |
+
+batch-2 吞吐是 batch-1 的 1.71 倍。batch-4 又比 batch-2 快 35.6%，并把
+batch-1 的吞吐提高到 2.32 倍。batch-4 探针 12 步没有 OOM 或 decode retry，
+驱动侧最高约 55.6 GiB/卡。正式 Stage A 因而使用 micro-batch 4、gradient
+accumulation 1；正式长训第 10 步为 2.219 s/step、12.617 samples/s、loss
+1.057328、零 decode retry，PyTorch 峰值 46.059 GiB。checkpoint interval 为
+1,000 步，只保留最近两个完成目录。
+
+batch-8 在 gradient accumulation 已经为 1 时会把 effective global batch 从 28
+改成 56。按 batch-2 到 batch-4 的实测显存斜率，它还会达到约 82–83 GiB/卡，
+超过 H100 容量，因此不进入正式配置。
+
+这组显存结论只适用于不加载 Wan/Action 主干的 Stage A。Stage B/C 暂时保留
+micro-batch 1、gradient accumulation 4；完整模型要独立完成 batch-2 canary
+后才能调整。
+
+## 8. 结论与边界
 
 当前证据支持启动七源正式训练：在线数据读取、VGGT 核心路径、Wan/Action 逐层
 耦合、三种 program、FSDP、validation、跨阶段初始化和精确恢复都已在真实模型

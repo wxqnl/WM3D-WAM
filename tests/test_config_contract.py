@@ -47,8 +47,11 @@ def test_runtime_forbids_gpu_zero_and_geometry_bridge_is_a_hard_gate() -> None:
     geometry = OmegaConf.load(ROOT / "configs/model/vggt_geometry_v1.yaml")
 
     assert list(runtime.runtime.permitted_cuda_devices) == [1, 2, 3, 4, 5, 6, 7]
-    assert list(runtime.runtime.visible_cuda_devices) == [1, 2, 5, 6, 7]
+    assert list(runtime.runtime.visible_cuda_devices) == [1, 2, 3, 4, 5, 6, 7]
     assert list(runtime.runtime.forbidden_cuda_devices) == [0]
+    assert runtime.runtime.micro_batch_per_gpu == 4
+    assert runtime.runtime.gradient_accumulation_steps == 1
+    assert runtime.runtime.effective_global_batch == 28
     assert (
         geometry.future_predictor.integration_status
         == "grouped_history_bridge_implemented"

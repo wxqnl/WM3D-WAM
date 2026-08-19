@@ -9,7 +9,8 @@ WM3D-WAM is a world-action model that combines three production-width paths:
 Video uses one 5 Hz, 9-frame, 1.6-second bucket. Robot commands keep their
 recorded 5/10/15/20 Hz clock. A nominal future chunk contains 8/16/24/32
 action events; timestamp jitter may retain one boundary event, so padded
-capacity is `ceil(1.6 * source_hz) + 1`. Training reads raw Parquet and MP4
+capacity is computed with the exact integer horizon as `source_hz * 8 // 5 + 1`.
+Training reads raw Parquet and MP4
 data online. It does not require a VGGT, depth, point, pose, or Wan-latent
 cache.
 
@@ -33,7 +34,7 @@ cache.
   inference;
 - exact Stage A/B/C optimizer ownership and learning rates.
 - a deterministic hierarchical program/family/source sampler, multi-process
-  DataLoader, five-GPU FSDP, validation, numbered checkpoints, exact resume,
+  DataLoader, multi-GPU FSDP, validation, numbered checkpoints, exact resume,
   and deliberate cross-stage initialization.
 
 Production-width preflights have run on real OXE Bridge and RoboCasa Atomic
@@ -61,15 +62,16 @@ cd /data/Minko/WM3D-WAM
 PYTHONPATH=src /data/Minko/.venvs/wm3d/bin/python -m pytest -q
 ```
 
-The current suite has 58 passing tests. GPU 0 is forbidden by the project
+The current suite has 60 passing tests. GPU 0 is forbidden by the project
 runtime contract; GPU experiments must use physical devices 1–7.
 
 ## Formal-training status
 
-The checked-in formal profile uses the five-card mesh `1,2,5,6,7`, which passed
-real Stage A/B/C FSDP canaries and exact checkpoint recovery. The runtime
-accepts any explicit subset of physical GPUs 1–7, but full-phase rank-local
-resume and Stage B-to-C initialization require the same ordered device mesh.
+The checked-in formal profile uses physical GPUs `1,2,3,4,5,6,7`. Stage A/B/C
+first passed production-width FSDP canaries and exact checkpoint recovery on
+the five-card mesh `1,2,5,6,7`; the seven-card Stage A formal run started on
+2026-08-20. Full-phase rank-local resume and Stage B-to-C initialization must
+keep the same ordered seven-card mesh.
 The sampler admits only `oxe_bridge`, `oxe_droid`, `oxe_furniture_bench`,
 `oxe_bc_z`, `robocasa_atomic`, `robocasa_composite`, and `robocasa_mg`.
 

@@ -12,7 +12,9 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 import yaml
 
+from .action_events import GroupedActionBatch
 from .episode_splits import is_v1_eligible_manifest_record
+from .grouped_history import GroupedActionTimelineBatch, GroupedStateHistoryBatch
 from .hierarchical_sampler import RecoverableHierarchicalSampler, WindowRequest
 from .online_episode import (
     OnlineEpisodeError,
@@ -41,8 +43,49 @@ class SourceEpisodeCatalog:
 
 @dataclass(frozen=True)
 class OnlineTrainingSample:
-    request: WindowRequest
+    requests: tuple[WindowRequest, ...]
     window: OnlineRobotWindow
+    task_texts: tuple[str, ...]
+    episode_ids: tuple[str, ...]
+    quality_weights: tuple[float, ...]
+    decode_retry_count: int
+
+    def __post_init__(self) -> None:
+        size = len(self.requests)
+        if size < 1 or any(
+            len(values) != size
+            for values in (self.task_texts, self.episode_ids, self.quality_weights)
+        ):
+            raise SourceContractError("online micro-batch metadata is misaligned")
+        if self.window.batch_size != size:
+            raise SourceContractError("online tensor and request batch sizes differ")
+        if not np.isfinite(self.quality_weights).all() or any(
+            weight <= 0.0 for weight in self.quality_weights
+        ):
+            raise SourceContractError("online micro-batch has an invalid quality weight")
+        routes = {
+            (request.program, request.family, request.source)
+            for request in self.requests
+        }
+        if len(routes) != 1:
+            raise SourceContractError("one micro-batch must share a routed model schema")
+
+    @property
+    def request(self) -> WindowRequest:
+        """Representative route; every request in the batch shares it."""
+
+        return self.requests[0]
+
+    @property
+    def batch_size(self) -> int:
+        return len(self.requests)
+
+    @property
+    def quality_weight(self) -> float:
+        first = float(self.quality_weights[0])
+        if any(abs(float(value) - first) > 1.0e-12 for value in self.quality_weights[1:]):
+            raise SourceContractError("one micro-batch must share a source quality weight")
+        return first
 
 
 def _load_split_ids(path: Path) -> set[str]:
@@ -186,7 +229,14 @@ class OnlineRobotDataset(Dataset[OnlineTrainingSample]):
                     max_action_dim=self.max_action_dim,
                     max_state_dim=self.max_state_dim,
                 )
-                return OnlineTrainingSample(request=request, window=window)
+                return OnlineTrainingSample(
+                    requests=(request,),
+                    window=window,
+                    task_texts=(window.task_text,),
+                    episode_ids=(window.episode_id,),
+                    quality_weights=(window.quality_weight,),
+                    decode_retry_count=window.decode_retry_count,
+                )
             except (OnlineEpisodeError, OSError) as exc:
                 errors.append(
                     f"{episode.get('episode_id', '<unknown>')}: {type(exc).__name__}: {exc}"
@@ -198,8 +248,143 @@ class OnlineRobotDataset(Dataset[OnlineTrainingSample]):
         )
 
 
-def identity_collate(value: OnlineTrainingSample) -> OnlineTrainingSample:
-    return value
+def _cat_action_batches(values: list[GroupedActionBatch]) -> GroupedActionBatch:
+    return GroupedActionBatch(
+        values=torch.cat([value.values for value in values], dim=0),
+        value_mask=torch.cat([value.value_mask for value in values], dim=0),
+        event_mask=torch.cat([value.event_mask for value in values], dim=0),
+        times_s=torch.cat([value.times_s for value in values], dim=0),
+        event_dt_s=torch.cat([value.event_dt_s for value in values], dim=0),
+        group_ids=torch.cat([value.group_ids for value in values], dim=0),
+        group_mask=torch.cat([value.group_mask for value in values], dim=0),
+        action_semantic_ids=torch.cat(
+            [value.action_semantic_ids for value in values], dim=0
+        ),
+        composition_operator_ids=torch.cat(
+            [value.composition_operator_ids for value in values], dim=0
+        ),
+        embodiment_ids=torch.cat([value.embodiment_ids for value in values], dim=0),
+    )
+
+
+def _cat_state_histories(
+    values: list[GroupedStateHistoryBatch],
+) -> GroupedStateHistoryBatch:
+    return GroupedStateHistoryBatch(
+        values=torch.cat([value.values for value in values], dim=0),
+        value_mask=torch.cat([value.value_mask for value in values], dim=0),
+        step_mask=torch.cat([value.step_mask for value in values], dim=0),
+        times_s=torch.cat([value.times_s for value in values], dim=0),
+        group_ids=torch.cat([value.group_ids for value in values], dim=0),
+        group_mask=torch.cat([value.group_mask for value in values], dim=0),
+        state_semantic_ids=torch.cat(
+            [value.state_semantic_ids for value in values], dim=0
+        ),
+        embodiment_ids=torch.cat([value.embodiment_ids for value in values], dim=0),
+    )
+
+
+def _cat_action_timelines(
+    values: list[GroupedActionTimelineBatch],
+) -> GroupedActionTimelineBatch:
+    return GroupedActionTimelineBatch(
+        events=_cat_action_batches([value.events for value in values]),
+        step_indices=torch.cat([value.step_indices for value in values], dim=0),
+        step_mask=torch.cat([value.step_mask for value in values], dim=0),
+    )
+
+
+def collate_online_training_samples(
+    values: list[OnlineTrainingSample],
+) -> OnlineTrainingSample:
+    """Stack a real micro-batch without changing clocks, views, or events."""
+
+    if not values or any(value.batch_size != 1 for value in values):
+        raise SourceContractError("DataLoader collate expects non-empty singleton samples")
+    windows = [value.window for value in values]
+    first = windows[0]
+    for window in windows[1:]:
+        if (
+            window.source != first.source
+            or window.source_id != first.source_id
+            or window.target_view_index != first.target_view_index
+            or window.valid_view_count != first.valid_view_count
+        ):
+            raise SourceContractError(
+                "micro-batch windows do not share source/view schema"
+            )
+        for name in (
+            "observed_images",
+            "future_anchor_images",
+            "wan_video",
+            "observed_view_valid_mask",
+            "future_view_valid_mask",
+        ):
+            if getattr(window, name).shape != getattr(first, name).shape:
+                raise SourceContractError(
+                    f"micro-batch tensor shape differs for {name}"
+                )
+    state_history = _cat_state_histories(
+        [window.state_history for window in windows]
+    )
+    action_history = _cat_action_timelines(
+        [window.action_history for window in windows]
+    )
+    future_action_history = _cat_action_timelines(
+        [window.future_action_history for window in windows]
+    )
+    future_actions = _cat_action_batches(
+        [window.future_actions for window in windows]
+    )
+    batch_window = OnlineRobotWindow(
+        source=first.source,
+        source_id=first.source_id,
+        episode_id=first.episode_id,
+        task_text=first.task_text,
+        observed_images=torch.stack(
+            [window.observed_images for window in windows], dim=0
+        ),
+        future_anchor_images=torch.stack(
+            [window.future_anchor_images for window in windows], dim=0
+        ),
+        wan_video=torch.stack([window.wan_video for window in windows], dim=0),
+        observed_view_valid_mask=torch.stack(
+            [window.observed_view_valid_mask for window in windows], dim=0
+        ),
+        future_view_valid_mask=torch.stack(
+            [window.future_view_valid_mask for window in windows], dim=0
+        ),
+        state_history=state_history,
+        action_history=action_history,
+        future_action_history=future_action_history,
+        future_actions=future_actions,
+        observation_times_s=torch.stack(
+            [window.observation_times_s for window in windows], dim=0
+        ),
+        future_video_times_s=torch.stack(
+            [window.future_video_times_s for window in windows], dim=0
+        ),
+        action_history_times_s=action_history.events.times_s,
+        future_action_times_s=future_actions.times_s,
+        quality_weight=first.quality_weight,
+        anchor_time_s=first.anchor_time_s,
+        target_view_index=first.target_view_index,
+        valid_view_count=first.valid_view_count,
+        sample_index=first.sample_index,
+        decode_retry_count=sum(window.decode_retry_count for window in windows),
+    )
+    return OnlineTrainingSample(
+        requests=tuple(request for value in values for request in value.requests),
+        window=batch_window,
+        task_texts=tuple(text for value in values for text in value.task_texts),
+        episode_ids=tuple(
+            episode for value in values for episode in value.episode_ids
+        ),
+        quality_weights=tuple(
+            weight for value in values for weight in value.quality_weights
+        ),
+        decode_retry_count=sum(value.decode_retry_count for value in values),
+    )
 
 
 def seed_online_worker(worker_id: int) -> None:
@@ -215,10 +400,16 @@ def build_online_dataloader(
     sampler: RecoverableHierarchicalSampler,
     *,
     num_workers: int,
+    micro_batch_size: int = 1,
     prefetch_factor: int = 2,
     timeout_seconds: float = 120.0,
 ) -> DataLoader[OnlineTrainingSample]:
-    if num_workers < 0 or prefetch_factor <= 0 or timeout_seconds <= 0.0:
+    if (
+        num_workers < 0
+        or micro_batch_size <= 0
+        or prefetch_factor <= 0
+        or timeout_seconds <= 0.0
+    ):
         raise SourceContractError("invalid DataLoader worker/prefetch configuration")
     worker_generator = torch.Generator()
     worker_generator.manual_seed(
@@ -227,8 +418,9 @@ def build_online_dataloader(
     kwargs: dict[str, object] = {
         "dataset": dataset,
         "sampler": sampler,
-        "batch_size": None,
-        "collate_fn": identity_collate,
+        "batch_size": int(micro_batch_size),
+        "drop_last": True,
+        "collate_fn": collate_online_training_samples,
         "num_workers": int(num_workers),
         "pin_memory": False,
         "worker_init_fn": seed_online_worker,

@@ -4,7 +4,7 @@
 |---|---|
 | 日期 | 2026-08-20 |
 | 分支 | `codex/implement-wm3d-wam-v1` |
-| 当前里程碑 | M4，七源五卡 Stage A/B/C canary 完成 |
+| 当前里程碑 | M4，七源五卡 Stage A/B/C canary 完成，七卡 Stage A 正式训练已启动 |
 | 生产模型配置 | `configs/model/wan_action_mot_v1.yaml` |
 | 数据合同 | `configs/data/grouped_robot_v1.yaml`、`configs/data/source_contracts_v1.yaml` |
 | 训练配置 | `configs/train/wm3d_wam_v1.yaml` |
@@ -91,11 +91,12 @@ codec 和输出层单独初始化。
 - Stage B/C rank-local model、optimizer、scheduler、RNG、cursor checkpoint；
 - exact resume、Stage A→B canonical initialization、B warmup→main→C local
   initialization；
+- source/view-schema 一致的真实 micro-batch collate；
 - 完成标记、原子 latest 指针和显式 checkpoint retention。
 
 完整阶段的 local shard 要求相同 world size 和相同有序物理 GPU mesh。checkpoint
 元数据记录并校验该列表。Stage A canonical checkpoint 可以重分片到不同 world
-size。
+size。精确恢复同时校验 micro-batch size 与 gradient accumulation。
 
 FSDP 只在 root 与完整 `WanActionMoT` 边界切分。VGGT functional block path 和
 MoT 内部 expert 不能单独 auto-wrap，否则 forward 会在参数 gather 边界之外读取
@@ -116,14 +117,15 @@ constant。
 
 ## 当前验证结论
 
-- 59 个 CPU 合同测试通过；
+- 60 个 CPU 合同测试通过；
 - 单卡真实数据的 Stage A、三种 interaction program、cache parity、target
   leakage、双向梯度归因和三步短拟合通过；
 - Stage A 双卡保存并精确恢复到下一步；
 - Stage B warmup 五卡完成 forward-world、joint、action-only，且跨进程恢复；
 - Stage B main 五卡解冻 Wan/VGGT deep 并保存完整 checkpoint；
 - Stage C 五卡完成 train、validation 和 checkpoint；
-- 当前正式 mesh `1,2,5,6,7` 的峰值显存低于 80 GiB。
+- 五卡 canary mesh `1,2,5,6,7` 的峰值显存低于 80 GiB；正式 mesh 已扩展为
+  `1,2,3,4,5,6,7`，Stage A 于 2026-08-20 启动。
 
 详细数值见 [EXPERIMENTS.md](EXPERIMENTS.md)，启动和恢复命令见
 [TRAINING.md](TRAINING.md)。代码已具备七源正式训练条件。尚未完成的是正式长训

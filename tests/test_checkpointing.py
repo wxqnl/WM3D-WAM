@@ -48,9 +48,10 @@ def test_rank_local_checkpoint_restores_model_optimizer_scheduler_and_cursor(
         scheduler=scheduler,
         phase="wan_action_warmup",
         global_step=3,
-        next_local_sample_index=7,
+        next_local_sample_index=8,
         seed=123,
         gradient_accumulation_steps=2,
+        micro_batch_size=2,
         extra_metadata={"phase_total_steps": 9},
     )
     metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
@@ -66,10 +67,11 @@ def test_rank_local_checkpoint_restores_model_optimizer_scheduler_and_cursor(
         expected_phase="wan_action_warmup",
         expected_seed=123,
         expected_gradient_accumulation_steps=2,
+        expected_micro_batch_size=2,
     )
 
     assert resumed.global_step == 3
-    assert resumed.next_local_sample_index == 7
+    assert resumed.next_local_sample_index == 8
     assert restored_scheduler.state_dict() == scheduler.state_dict()
     assert restored_optimizer.state_dict()["param_groups"] == optimizer.state_dict()[
         "param_groups"
@@ -131,6 +133,7 @@ def test_rank_local_checkpoint_rejects_a_different_physical_mesh(
         next_local_sample_index=1,
         seed=5,
         gradient_accumulation_steps=1,
+        micro_batch_size=1,
         extra_metadata={"physical_cuda_devices": [1]},
     )
 
@@ -143,5 +146,6 @@ def test_rank_local_checkpoint_rejects_a_different_physical_mesh(
             expected_phase="wan_action_main",
             expected_seed=5,
             expected_gradient_accumulation_steps=1,
+            expected_micro_batch_size=1,
             expected_physical_cuda_devices=[2],
         )

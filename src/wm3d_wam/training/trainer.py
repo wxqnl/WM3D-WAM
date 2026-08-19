@@ -10,7 +10,7 @@ import math
 import os
 from pathlib import Path
 import time
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import torch
 import torch.distributed as dist
@@ -117,6 +117,7 @@ class TrainingPaths:
 class TrainerOptions:
     phase: str
     max_steps: int
+    micro_batch_size: int
     gradient_accumulation_steps: int
     num_workers: int
     prefetch_factor: int
@@ -139,6 +140,7 @@ class TrainerOptions:
             raise TrainerError(f"unknown training phase {self.phase!r}")
         for name in (
             "max_steps",
+            "micro_batch_size",
             "gradient_accumulation_steps",
             "log_interval",
             "checkpoint_interval",
@@ -159,6 +161,13 @@ class TrainerOptions:
         if bool(self.validation_interval) != bool(self.validation_samples_per_rank):
             raise TrainerError(
                 "validation interval and sample count must both be zero or both positive"
+            )
+        if (
+            self.validation_samples_per_rank
+            and self.validation_samples_per_rank % self.micro_batch_size
+        ):
+            raise TrainerError(
+                "validation_samples_per_rank must contain complete micro-batches"
             )
         if self.resume is not None and self.initialize_from is not None:
             raise TrainerError("exact resume and cross-phase initialization are mutually exclusive")
@@ -212,6 +221,18 @@ class PromptEncoderCache:
         while len(self.cache) > self.max_entries:
             self.cache.popitem(last=False)
         return value
+
+    @torch.no_grad()
+    def encode_batch(
+        self, prompts: Sequence[str]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not prompts:
+            raise TrainerError("prompt micro-batch is empty")
+        encoded = [self.encode(prompt) for prompt in prompts]
+        return (
+            torch.cat([value[0] for value in encoded], dim=0),
+            torch.cat([value[1] for value in encoded], dim=0),
+        )
 
 
 def _video_config(model_config: Mapping[str, Any]) -> dict[str, Any]:
@@ -441,7 +462,7 @@ def _forward_sample(
     gradient_checkpointing: bool,
 ):
     window = sample.window.to(device=device, dtype=dtype)
-    context, context_mask = prompt_cache.encode(window.task_text)
+    context, context_mask = prompt_cache.encode_batch(sample.task_texts)
     with torch.autocast(device_type="cuda", dtype=dtype):
         if sample.request.program == "geometry_pretrain":
             output = model(
@@ -542,9 +563,10 @@ def _validate(
                 dtype=dtype,
                 gradient_checkpointing=False,
             )
+            batch_size = sample.batch_size
             for name, value in output.detached_metrics().items():
-                sums[name] = sums.get(name, 0.0) + float(value)
-            count += 1
+                sums[name] = sums.get(name, 0.0) + float(value) * batch_size
+            count += batch_size
     if was_training:
         model.train()
     local = {name: value / max(1, count) for name, value in sums.items()}
@@ -687,6 +709,7 @@ def train(
             expected_phase=options.phase,
             expected_seed=options.seed,
             expected_gradient_accumulation_steps=options.gradient_accumulation_steps,
+            expected_micro_batch_size=options.micro_batch_size,
             expected_physical_cuda_devices=context.physical_cuda_devices,
         )
         if int(resumed.metadata.get("phase_total_steps", -1)) != options.max_steps:
@@ -704,12 +727,14 @@ def train(
         seed=options.seed,
         rank=context.rank,
         world_size=context.world_size,
+        micro_batch_size=options.micro_batch_size,
         start_local_index=next_local_index,
     )
     train_loader = build_online_dataloader(
         train_dataset,
         train_sampler,
         num_workers=options.num_workers,
+        micro_batch_size=options.micro_batch_size,
         prefetch_factor=options.prefetch_factor,
     )
     train_iterator = iter(train_loader)
@@ -723,6 +748,7 @@ def train(
             seed=options.seed + 10_000,
             rank=context.rank,
             world_size=context.world_size,
+            micro_batch_size=options.micro_batch_size,
             start_local_index=0,
             num_local_samples=options.validation_samples_per_rank,
         )
@@ -730,6 +756,7 @@ def train(
             validation_dataset,
             validation_sampler,
             num_workers=max(0, min(options.num_workers, 2)),
+            micro_batch_size=options.micro_batch_size,
             prefetch_factor=options.prefetch_factor,
         )
     prompt_cache = PromptEncoderCache(
@@ -747,7 +774,10 @@ def train(
         "world_size": context.world_size,
         "physical_cuda_devices": list(context.physical_cuda_devices),
         "gradient_accumulation_steps": options.gradient_accumulation_steps,
-        "effective_global_batch": context.world_size * options.gradient_accumulation_steps,
+        "micro_batch_size": options.micro_batch_size,
+        "effective_global_batch": context.world_size
+        * options.micro_batch_size
+        * options.gradient_accumulation_steps,
         "checkpoint_interval": options.checkpoint_interval,
         "keep_last_checkpoints": options.keep_last_checkpoints,
         "train_episode_counts": train_dataset.episode_counts,
@@ -808,7 +838,7 @@ def train(
                     dtype=dtype,
                     gradient_checkpointing=True,
                 )
-                weighted_loss = output.total_loss * float(sample.window.quality_weight)
+                weighted_loss = output.total_loss * sample.quality_weight
                 scaled_loss = weighted_loss / options.gradient_accumulation_steps
                 scaled_loss.backward()
             for name, value in output.detached_metrics().items():
@@ -816,14 +846,17 @@ def train(
             accumulated["loss_weighted"] = accumulated.get("loss_weighted", 0.0) + float(
                 weighted_loss.detach()
             )
-            program_counts[sample.request.program] = program_counts.get(sample.request.program, 0) + 1
-            source_counts[sample.request.source] = source_counts.get(sample.request.source, 0) + 1
-            retry_count += sample.window.decode_retry_count
+            for request in sample.requests:
+                program_counts[request.program] = program_counts.get(request.program, 0) + 1
+                source_counts[request.source] = source_counts.get(request.source, 0) + 1
+            retry_count += sample.decode_retry_count
         grad_norm = _clip_grad_norm(wrapped, options.max_grad_norm)
         optimizer.step()
         scheduler.step()
         global_step += 1
-        local_samples_committed += options.gradient_accumulation_steps
+        local_samples_committed += (
+            options.gradient_accumulation_steps * options.micro_batch_size
+        )
         torch.cuda.synchronize(context.device)
         step_seconds = time.perf_counter() - step_start
         local_metrics = {
@@ -836,6 +869,7 @@ def train(
                 "step_seconds": step_seconds,
                 "samples_per_second_global": (
                     context.world_size
+                    * options.micro_batch_size
                     * options.gradient_accumulation_steps
                     / max(step_seconds, 1.0e-12)
                 ),
@@ -891,9 +925,11 @@ def train(
                 next_local_sample_index=local_samples_committed,
                 seed=options.seed,
                 gradient_accumulation_steps=options.gradient_accumulation_steps,
+                micro_batch_size=options.micro_batch_size,
                 extra_metadata={
                     "phase_total_steps": options.max_steps,
                     "effective_global_batch": context.world_size
+                    * options.micro_batch_size
                     * options.gradient_accumulation_steps,
                     "physical_cuda_devices": list(context.physical_cuda_devices),
                 },

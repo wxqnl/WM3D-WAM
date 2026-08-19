@@ -225,10 +225,13 @@ def save_checkpoint(
     next_local_sample_index: int,
     seed: int,
     gradient_accumulation_steps: int,
+    micro_batch_size: int,
     extra_metadata: Mapping[str, object] | None = None,
 ) -> Path:
     """Write tensor payloads first and ``metadata.json`` as completion marker."""
 
+    if int(gradient_accumulation_steps) <= 0 or int(micro_batch_size) <= 0:
+        raise CheckpointError("checkpoint batch controls must be positive")
     path = checkpoint_directory(root, global_step)
     if _rank() == 0:
         if path.exists():
@@ -293,6 +296,7 @@ def save_checkpoint(
             "world_size": _world_size(),
             "seed": int(seed),
             "gradient_accumulation_steps": int(gradient_accumulation_steps),
+            "micro_batch_size": int(micro_batch_size),
             "next_local_sample_index": int(next_local_sample_index),
         }
         if extra_metadata:
@@ -339,6 +343,7 @@ def load_checkpoint(
     expected_phase: str,
     expected_seed: int,
     expected_gradient_accumulation_steps: int,
+    expected_micro_batch_size: int,
     expected_physical_cuda_devices: Sequence[int] | None = None,
 ) -> ResumeState:
     path = resolve_checkpoint(path_or_root)
@@ -348,6 +353,7 @@ def load_checkpoint(
         "world_size": _world_size(),
         "seed": int(expected_seed),
         "gradient_accumulation_steps": int(expected_gradient_accumulation_steps),
+        "micro_batch_size": int(expected_micro_batch_size),
     }
     for name, value in expected.items():
         if metadata.get(name) != value:

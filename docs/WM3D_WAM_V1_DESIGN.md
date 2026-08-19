@@ -2,7 +2,7 @@
 
 | 项目 | 内容 |
 |---|---|
-| 状态 | Revision 3，七源 Stage A/B/C 五卡实现与 canary 完成 |
+| 状态 | Revision 3，五卡 Stage A/B/C canary 完成，七卡 Stage A 正式训练已启动 |
 | 日期 | 2026-08-20 |
 | 目标仓库 | wxqnl/WM3D-WAM |
 | 当前分支 | codex/implement-wm3d-wam-v1 |
@@ -69,7 +69,8 @@ episode。其余 14 个 source 保持 excluded，不会被 sampler 静默纳入�
 
 五卡 mesh `1,2,5,6,7` 已完成 Stage A canonical checkpoint/resume、Stage B
 warmup rank-local resume、Stage B main 解冻和 Stage C train/validation/checkpoint。
-这组结果关闭了训练 pipeline 门禁；策略质量仍由正式长训和后续评测决定。
+七卡 mesh `1,2,3,4,5,6,7` 于 2026-08-20 启动 Stage A 正式长训。策略质量仍由
+完整长训和后续评测决定。
 
 ## 2. 证据与设计依据
 
@@ -748,19 +749,21 @@ FastWAM 的正式训练会更新 MoT 主干。永久冻结 Wan 会限制视频�
 
 ### 10.7 分布式运行
 
-    CUDA_VISIBLE_DEVICES=1,2,5,6,7
-    nproc_per_node=5
-    micro_batch_per_gpu=1
-    gradient_accumulation_steps=4
-    effective_global_batch=20
+    CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7
+    nproc_per_node=7
+    stage_a_micro_batch_per_gpu=4
+    stage_a_gradient_accumulation_steps=1
+    full_phase_micro_batch_per_gpu=1
+    full_phase_gradient_accumulation_steps=4
+    effective_global_batch=28
     precision=bf16
     fsdp=full_shard
     activation_checkpointing=true
     NCCL_NVLS_ENABLE=0
 
 GPU 0 在 launcher 与 preflight 中都列为 forbidden device。runtime 支持显式列出
-物理 GPU 1–7 的任意子集；当前正式配置采用已经通过完整模型 canary 的五卡
-mesh。Stage B/C 的 rank-local checkpoint 要求相同 world size 和相同有序物理
+物理 GPU 1–7 的任意子集；五卡 mesh 已完成完整模型 canary，正式训练使用全部
+七卡。Stage B/C 的 rank-local checkpoint 要求相同 world size 和相同有序物理
 GPU mesh。已经完成的门禁为：
 
 1. 单卡生产宽度 shape、mask、gradient ownership 和三步短拟合；
@@ -1042,21 +1045,24 @@ sampling:
 
 runtime:
   permitted_gpus: [1, 2, 3, 4, 5, 6, 7]
-  visible_gpus: [1, 2, 5, 6, 7]
+  visible_gpus: [1, 2, 3, 4, 5, 6, 7]
   forbidden_gpus: [0]
-  nproc_per_node: 5
+  nproc_per_node: 7
   precision: bf16
   fsdp: full_shard
-  micro_batch_per_gpu: 1
-  gradient_accumulation_steps: 4
-  effective_global_batch: 20
+  stage_a_micro_batch_per_gpu: 4
+  stage_a_gradient_accumulation_steps: 1
+  full_phase_micro_batch_per_gpu: 1
+  full_phase_gradient_accumulation_steps: 4
+  effective_global_batch: 28
   nccl_nvls_enable: 0
 
 training:
   stage_a_steps: 30000
   stage_b_steps: 40000
   stage_c_steps: 20000
-  checkpoint_interval_steps: 5000
+  stage_a_checkpoint_interval_steps: 1000
+  full_phase_checkpoint_interval_steps: 5000
   keep_last_completed_checkpoints: 2
   persistent_vggt_cache: false
   persistent_wan_cache: false
@@ -1081,7 +1087,7 @@ training:
 
 ### 18.1 数据划分合理吗
 
-旧方案的数据总量与分层抽样思路合理，但 dual-rate 视频桶和把上游 train 当最终 train 的表述不够严谨。Revision 3 使用 episode/parent 层的显式 train/val/test、objective-specific family sampling、21-source gate 和统一 5 Hz / 9 帧视频。Action 保留原生频率。当前只训练 7 个 verified source，五卡 profile 已跑通。
+旧方案的数据总量与分层抽样思路合理，但 dual-rate 视频桶和把上游 train 当最终 train 的表述不够严谨。Revision 3 使用 episode/parent 层的显式 train/val/test、objective-specific family sampling、21-source gate 和统一 5 Hz / 9 帧视频。Action 保留原生频率。当前只训练 7 个 verified source；五卡 canary 已通过，正式训练使用七卡。
 
 ### 18.2 Action 要不要走 Wan2.2
 

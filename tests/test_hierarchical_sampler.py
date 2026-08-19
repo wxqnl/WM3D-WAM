@@ -92,6 +92,34 @@ def test_distributed_ranks_share_route_schema_at_each_local_step():
         assert len({request.global_sample_index for request in requests}) == 4
 
 
+def test_two_samples_in_each_micro_batch_share_route_but_not_window():
+    contracts, counts, profile = _fixture()
+    sampler = RecoverableHierarchicalSampler(
+        episode_counts=counts,
+        contracts=contracts,
+        profile_weights=profile,
+        program_mix={
+            "action_only": 0.5,
+            "forward_world": 0.3,
+            "joint_world_action": 0.2,
+        },
+        seed=29,
+        rank=0,
+        world_size=7,
+        micro_batch_size=2,
+    )
+    for start in range(0, 40, 2):
+        first = sampler.request_at(start)
+        second = sampler.request_at(start + 1)
+        assert (first.program, first.family, first.source) == (
+            second.program,
+            second.family,
+            second.source,
+        )
+        assert first.target_view_fraction == second.target_view_fraction
+        assert first.global_sample_index != second.global_sample_index
+
+
 def test_source_weight_contract_keeps_robocasa_10_60_30():
     contracts, _, profile = _fixture()
     weights = source_sampling_weights(contracts, profile)

@@ -72,19 +72,22 @@ FSDP checkpoint 合同、精确恢复和 checkpoint 保留策略。
 
 ## 4. 分布式运行合同
 
-当前验证过的完整模型 mesh 是物理 GPU `1,2,5,6,7`：
+正式训练使用物理 GPU `1,2,3,4,5,6,7`。此前 Stage A/B/C 完整模型 canary 已在
+`1,2,5,6,7` 上通过；2026-08-20 启动的 Stage A 长训扩展到七卡：
 
 ```bash
-nvidia-smi -i 1,2,5,6,7 \
+nvidia-smi -i 1,2,3,4,5,6,7 \
   --query-gpu=index,memory.used,utilization.gpu \
   --format=csv
-export CUDA_VISIBLE_DEVICES=1,2,5,6,7
+export CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7
 ```
 
 运行时允许显式列出物理 GPU 1–7 的任意非空子集，拒绝 GPU 0、重复 ID、UUID
-写法和越界 ID。当前五卡配置使用 BF16 forward/reduce、FP32 master weights、
-FSDP FULL_SHARD、每卡 micro-batch 1、gradient accumulation 4，有效 global
-batch 为 20。node 42 的 NCCL NVLS 多 rank 路径存在驱动错误，launcher 默认
+写法和越界 ID。当前七卡配置使用 BF16 forward/reduce、FP32 master weights 和
+FSDP FULL_SHARD。Stage A 已验证每卡 micro-batch 4、gradient accumulation 1，
+有效 global batch 为 28。完整 Wan/Action 阶段的 batch-2 尚未做显存 canary，
+因此 Stage B/C 先使用 micro-batch 1、gradient accumulation 4，global batch 仍为
+28。node 42 的 NCCL NVLS 多 rank 路径存在驱动错误，launcher 默认
 设置 `NCCL_NVLS_ENABLE=0`，使用已验证的普通 NVLink collective。
 
 每个 rank 在进入 FSDP forward 前交换数据读取状态。某个 worker 解码失败时，
@@ -101,10 +104,12 @@ batch 为 20。node 42 的 NCCL NVLS 多 rank 路径存在驱动错误，launche
 checkpoint 包含 model、optimizer、scheduler、每 rank 的 Python/NumPy/CPU/CUDA
 RNG 和已提交 sampler cursor。程序先写全部 tensor 与 runtime payload，最后写
 `metadata.json` 完成标记，再原子更新 `latest.txt`。恢复不会使用 DataLoader
-预取位置，因此不会跳样本。
+预取位置，因此不会跳样本。精确恢复还会校验 micro-batch 与 gradient
+accumulation，避免从不同 batch 合同继续同一轨迹。
 
-完整 Stage B-main/C checkpoint 在五卡上约 91 GiB。以下正式命令每 5,000 步
-保存一次，并显式设置 `--keep-last-checkpoints 2`。清理只删除更老且拥有合法
+完整 Stage B-main/C checkpoint 在五卡 canary 中约 91 GiB，七卡总量预计相近。
+Stage A 每 1,000 步保存，完整 Wan/Action 阶段每 5,000 步保存，并显式设置
+`--keep-last-checkpoints 2`。清理只删除更老且拥有合法
 完成标记的编号目录；默认值 0 不自动删除任何 checkpoint。
 
 ## 6. 正式训练命令
@@ -115,17 +120,18 @@ main 和 Stage C 的 `max_steps` 都是各自 phase 内的步数。
 ### 6.1 Stage A：Geometry-GAM，30,000 步
 
 ```bash
-"$WM3D_TORCHRUN" --standalone --nproc_per_node=5 \
+"$WM3D_TORCHRUN" --standalone --nproc_per_node=7 \
   scripts/train_wm3d_wam.py \
   --phase geometry_gam \
   --max-steps 30000 \
+  --micro-batch-size 4 \
   --warmup-steps 500 \
-  --gradient-accumulation-steps 4 \
+  --gradient-accumulation-steps 1 \
   --num-workers 4 \
   --log-interval 10 \
   --validation-interval 500 \
   --validation-samples-per-rank 8 \
-  --checkpoint-interval 5000 \
+  --checkpoint-interval 1000 \
   --keep-last-checkpoints 2 \
   --output-dir outputs/train/wm3d_wam_v1/stage_a_geometry
 ```
@@ -133,10 +139,11 @@ main 和 Stage C 的 `max_steps` 都是各自 phase 内的步数。
 ### 6.2 Stage B warmup：Action/geometry，2,000 步
 
 ```bash
-"$WM3D_TORCHRUN" --standalone --nproc_per_node=5 \
+"$WM3D_TORCHRUN" --standalone --nproc_per_node=7 \
   scripts/train_wm3d_wam.py \
   --phase wan_action_warmup \
   --max-steps 2000 \
+  --micro-batch-size 1 \
   --warmup-steps 200 \
   --gradient-accumulation-steps 4 \
   --num-workers 4 \
@@ -152,10 +159,11 @@ main 和 Stage C 的 `max_steps` 都是各自 phase 内的步数。
 ### 6.3 Stage B main：解冻 Wan/VGGT deep，38,000 步
 
 ```bash
-"$WM3D_TORCHRUN" --standalone --nproc_per_node=5 \
+"$WM3D_TORCHRUN" --standalone --nproc_per_node=7 \
   scripts/train_wm3d_wam.py \
   --phase wan_action_main \
   --max-steps 38000 \
+  --micro-batch-size 1 \
   --warmup-steps 500 \
   --gradient-accumulation-steps 4 \
   --num-workers 4 \
@@ -171,10 +179,11 @@ main 和 Stage C 的 `max_steps` 都是各自 phase 内的步数。
 ### 6.4 Stage C：Tri-stream alignment，20,000 步
 
 ```bash
-"$WM3D_TORCHRUN" --standalone --nproc_per_node=5 \
+"$WM3D_TORCHRUN" --standalone --nproc_per_node=7 \
   scripts/train_wm3d_wam.py \
   --phase tri_stream_alignment \
   --max-steps 20000 \
+  --micro-batch-size 1 \
   --warmup-steps 500 \
   --gradient-accumulation-steps 4 \
   --num-workers 4 \
@@ -188,19 +197,20 @@ main 和 Stage C 的 `max_steps` 都是各自 phase 内的步数。
 ```
 
 Stage B warmup、main 和 Stage C 必须使用相同的
-`CUDA_VISIBLE_DEVICES=1,2,5,6,7` 顺序。参数 stage 的学习率与可训练模块由
+`CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7` 顺序。参数 stage 的学习率与可训练模块由
 `src/wm3d_wam/training/parameter_groups.py` 唯一决定；CLI 不接受临时覆盖。
 
 ## 7. 精确恢复与计划停机
 
-恢复时复用原 phase、max steps、seed、gradient accumulation、output 目录和有序
-GPU mesh，把 `--initialize-from` 改成 `--resume`：
+恢复时复用原 phase、max steps、seed、micro-batch、gradient accumulation、output
+目录和有序 GPU mesh，把 `--initialize-from` 改成 `--resume`：
 
 ```bash
-"$WM3D_TORCHRUN" --standalone --nproc_per_node=5 \
+"$WM3D_TORCHRUN" --standalone --nproc_per_node=7 \
   scripts/train_wm3d_wam.py \
   --phase wan_action_main \
   --max-steps 38000 \
+  --micro-batch-size 1 \
   --warmup-steps 500 \
   --gradient-accumulation-steps 4 \
   --num-workers 4 \
@@ -224,3 +234,17 @@ GPU mesh，把 `--initialize-from` 改成 `--resume`：
 Stage B main 五卡深层解冻；Stage C 五卡 train、validation 和完整 checkpoint。
 数值与输出目录见 [EXPERIMENTS.md](EXPERIMENTS.md)。这些门禁证明训练 pipeline
 能运行和恢复，不代表下游策略质量已经达标。
+
+## 9. 当前正式运行
+
+Stage A 七卡长训于 2026-08-20 启动，tmux session 为
+`wm3d_stage_a_7gpu`，输出目录为
+`outputs/train/wm3d_wam_v1/stage_a_geometry`，完整控制台日志为
+`outputs/train/wm3d_wam_v1/stage_a_geometry.launch.log`。当前运行使用
+micro-batch 4、gradient accumulation 1；被替换的 batch-1 启动记录保存在
+`outputs/train/wm3d_wam_v1/stage_a_geometry_bs1_superseded_20260820_0243`，batch-2
+探针和早期长训分别保存在
+`outputs/train/wm3d_wam_v1/stage_a_geometry_bs2_probe_20260820_0255` 与
+`outputs/train/wm3d_wam_v1/stage_a_geometry_bs2_superseded_20260820_0307`，batch-4
+探针保存在
+`outputs/train/wm3d_wam_v1/stage_a_geometry_bs4_probe_20260820_0307_v2`。
