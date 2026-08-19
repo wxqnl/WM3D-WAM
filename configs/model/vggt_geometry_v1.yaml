@@ -1,4 +1,7 @@
-# The encoder target is runnable after VGGT source and weights are provisioned.
+observed_keyframe_indices: [0, 5, 10, 15]
+future_anchor_count: 4
+geometry_output_patch_grid: 4
+
 encoder:
   _target_: wm3d_wam.vendor.vggt_gam.vggt_encoder.VGGTEncoder
   ckpt_path: ${oc.env:VGGT_CKPT}
@@ -7,7 +10,8 @@ encoder:
   split_layer: 4
   freeze_backbone: false
   n_action_steps: 0
-  views_per_timestep: 3
+  # Overridden by the exact real-view bucket at construction time.
+  views_per_timestep: 2
   action_steps_per_token: 1
   use_temporal_embed: false
   action_input_rate: 0.4
@@ -15,12 +19,9 @@ encoder:
   deep_time_mode: causal
   local_files_only: true
 
-# This records the selected node-41 GAM predictor. The grouped history bridge
-# is deliberately a hard implementation gate; training must not replace it
-# with a flattened source-specific action vector.
 future_predictor:
-  reference_target: wm3d_wam.vendor.vggt_gam.future_predictor.GAMFuturePredictor
-  integration_status: grouped_history_bridge_required
+  _target_: wm3d_wam.vendor.vggt_gam.future_predictor.GAMFuturePredictor
+  integration_status: grouped_history_bridge_implemented
   d_da3: 1024
   d_model: 1024
   depth: 12
@@ -37,3 +38,23 @@ future_predictor:
   gradient_checkpointing: true
   observed_keyframes: 4
   future_anchor_times_s: [0.4, 0.8, 1.2, 1.6]
+
+history_connector:
+  _target_: wm3d_wam.models.GroupedHistoryConnector
+  d_model: 1024
+  max_groups: 8
+  max_state_dim: 32
+  state_semantic_vocab_size: 128
+  group_vocab_size: 256
+  embodiment_vocab_size: 4096
+  time_fourier_dim: 128
+  time_max_frequency_hz: 32.0
+  transformer_depth: 4
+  num_heads: 16
+  ffn_ratio: 4.0
+  dropout: 0.0
+
+auxiliary_action_heads:
+  _target_: wm3d_wam.models.GroupedGeometryActionHeads
+  num_heads: 16
+  ffn_ratio: 2.0

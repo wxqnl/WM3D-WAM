@@ -111,7 +111,10 @@ def select_observed_world_window(
     anchor = float(clock[anchor_index])
     context_start = anchor - float(context_horizon_s)
     context_candidates = np.flatnonzero(
-        (clock >= context_start) & (np.arange(clock.size) <= anchor_index)
+        (clock >= context_start)
+        & (np.arange(clock.size) <= anchor_index)
+        # Reserve one real row for the leading action-bin boundary.
+        & (np.arange(clock.size) >= 1)
     )
     context_targets = np.linspace(
         context_start, anchor, context_samples, dtype=np.float64

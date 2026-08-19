@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
 import torch
@@ -443,6 +444,58 @@ class GroupedActionFlowExpert(ActionDiT):
                     self_attn_mask=self_attention_mask,
                 )
         return self.post_dit(tokens, pre_state)
+
+
+def load_grouped_action_backbone(
+    expert: GroupedActionFlowExpert,
+    path: str | Path,
+) -> None:
+    """Load the locally preprocessed Wan2.2 backbone into a grouped expert.
+
+    Grouped codec parameters remain independently initialized.  Every shared
+    transformer/text/time key must be present with the exact target shape.
+    """
+
+    path = Path(path).expanduser().resolve(strict=True)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"ActionDiT backbone must be a regular local file: {path}")
+    payload = torch.load(str(path), map_location="cpu", weights_only=True)
+    if not isinstance(payload, dict):
+        raise ValueError("ActionDiT backbone payload must be a dict")
+    backbone = payload.get("backbone_state_dict")
+    meta = payload.get("meta")
+    if not isinstance(backbone, dict) or not isinstance(meta, dict):
+        raise ValueError("ActionDiT backbone payload is missing state/meta")
+    expected_meta = {
+        "hidden_dim": int(expert.hidden_dim),
+        "ffn_dim": int(expert.ffn_dim),
+        "num_layers": int(len(expert.blocks)),
+        "num_heads": int(expert.num_heads),
+        "attn_head_dim": int(expert.attn_head_dim),
+        "text_dim": int(expert.text_dim),
+        "freq_dim": int(expert.freq_dim),
+    }
+    for name, expected in expected_meta.items():
+        if name not in meta or int(meta[name]) != expected:
+            raise ValueError(
+                f"ActionDiT backbone meta.{name}={meta.get(name)!r}, expected {expected}"
+            )
+    state = expert.state_dict()
+    expected_keys = expert.backbone_key_set(state.keys())
+    provided_keys = set(backbone)
+    if provided_keys != expected_keys:
+        raise ValueError(
+            "ActionDiT backbone key mismatch: "
+            f"missing={sorted(expected_keys-provided_keys)[:8]}, "
+            f"unexpected={sorted(provided_keys-expected_keys)[:8]}"
+        )
+    merged = dict(state)
+    for key in expected_keys:
+        value = backbone[key]
+        if not isinstance(value, torch.Tensor) or value.shape != state[key].shape:
+            raise ValueError(f"ActionDiT backbone tensor {key!r} has the wrong shape")
+        merged[key] = value.to(device=state[key].device, dtype=state[key].dtype)
+    expert.load_state_dict(merged, strict=True)
 
 
 def grouped_action_flow_loss(

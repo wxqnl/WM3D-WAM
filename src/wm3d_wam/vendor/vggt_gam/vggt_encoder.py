@@ -897,6 +897,32 @@ class VGGTEncoder(nn.Module):
 
         result: Dict[str, torch.Tensor] = {}
         if with_action:
+            deep_visual = torch.cat(
+                [current[:, :, :action_index], current[:, :, action_index + 1 :]],
+                dim=2,
+            )
+        else:
+            deep_visual = current
+        deep_visual = deep_visual.reshape(
+            batch_size, steps, views, expected_tokens, channels
+        )
+        if step_valid_mask is not None:
+            valid_steps = step_valid_mask.to(
+                device=deep_visual.device, dtype=deep_visual.dtype
+            )
+            while valid_steps.ndim > 2:
+                valid_steps = valid_steps.any(dim=-1)
+            if valid_steps.shape != (batch_size, steps):
+                raise ValueError(
+                    f"step_valid_mask shape {tuple(valid_steps.shape)} != "
+                    f"{(batch_size, steps)}."
+                )
+            deep_visual = deep_visual * valid_steps[:, :, None, None, None]
+        # Expose the actual pair-23 visual state.  WM3D-WAM uses predicted
+        # future slots from this tensor as geometry K/V; DPT outputs remain
+        # auxiliary supervision and are never substituted for these tokens.
+        result["deep_visual_tokens"] = deep_visual
+        if with_action:
             final_action = current[:, :, action_index].reshape(
                 batch_size, steps, views, channels
             )

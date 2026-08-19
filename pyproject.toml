@@ -10,12 +10,19 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
 dependencies = [
+  "av>=12",
   "einops>=0.7",
   "hydra-core>=1.3",
   "numpy>=1.24,<2",
   "omegaconf>=2.3",
+  "pyarrow>=15",
+  "pyyaml>=6",
+  "rich>=13",
   "safetensors>=0.4",
+  "sentencepiece>=0.2",
   "torch>=2.5",
+  "tqdm>=4.66",
+  "transformers>=4.40",
 ]
 
 [project.optional-dependencies]

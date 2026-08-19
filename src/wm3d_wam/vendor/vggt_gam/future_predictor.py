@@ -1020,6 +1020,14 @@ class GAMFuturePredictor(nn.Module):
         self.future_visual_proj = nn.Linear(d_model, d_da3, bias=True)
         self.action_proj = nn.Linear(d_model, d_da3, bias=True)
         self.future_proprio_proj = nn.Linear(d_model, proprio_dim, bias=True)
+        # WM3D-WAM rolls out in the predictor token space because its robot
+        # state/action ABI is grouped and embodiment dependent.  These two
+        # heads predict the next history slots without flattening the grouped
+        # fields back into one source-specific vector.
+        self.future_proprio_token_proj = nn.Linear(d_model, d_model, bias=True)
+        self.future_action_history_token_proj = nn.Linear(
+            d_model, d_model, bias=True
+        )
 
         # Small-std init so outputs are non-degenerate from step 0; residuals
         # are already zero-inert via LayerScale, so the head needs nonzero
@@ -1030,6 +1038,10 @@ class GAMFuturePredictor(nn.Module):
         nn.init.zeros_(self.action_proj.bias)
         nn.init.normal_(self.future_proprio_proj.weight, std=0.02)
         nn.init.zeros_(self.future_proprio_proj.bias)
+        nn.init.normal_(self.future_proprio_token_proj.weight, std=0.02)
+        nn.init.zeros_(self.future_proprio_token_proj.bias)
+        nn.init.normal_(self.future_action_history_token_proj.weight, std=0.02)
+        nn.init.zeros_(self.future_action_history_token_proj.bias)
 
         # --- Optional SIGReg ---
         self.sigreg = sigreg
@@ -1121,11 +1133,26 @@ class GAMFuturePredictor(nn.Module):
         self,
         proprio: Optional[torch.Tensor],
         proprio_history: Optional[torch.Tensor],
+        proprio_token_embeddings: Optional[torch.Tensor],
         H: int,
         batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
+        if proprio_token_embeddings is not None:
+            if proprio is not None or proprio_history is not None:
+                raise ValueError(
+                    "Pass grouped proprio token embeddings or flat proprio, not both."
+                )
+            return self._coerce_grouped_history_tokens(
+                proprio_token_embeddings,
+                H=H,
+                batch_size=batch_size,
+                device=device,
+                dtype=dtype,
+                slot_type=3,
+                name="proprio_token_embeddings",
+            )
         if proprio_history is None:
             extra = ""
             if proprio is not None:
@@ -1160,11 +1187,26 @@ class GAMFuturePredictor(nn.Module):
     def _embed_action_history(
         self,
         past_action_history: Optional[torch.Tensor],
+        past_action_token_embeddings: Optional[torch.Tensor],
         H: int,
         batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
+        if past_action_token_embeddings is not None:
+            if past_action_history is not None:
+                raise ValueError(
+                    "Pass grouped action token embeddings or flat actions, not both."
+                )
+            return self._coerce_grouped_history_tokens(
+                past_action_token_embeddings,
+                H=H,
+                batch_size=batch_size,
+                device=device,
+                dtype=dtype,
+                slot_type=4,
+                name="past_action_token_embeddings",
+            )
         if past_action_history is None:
             raise ValueError("GAMFuturePredictor requires aligned past_action_history.")
         if past_action_history.shape[0] != batch_size:
@@ -1195,6 +1237,42 @@ class GAMFuturePredictor(nn.Module):
         proj_dtype = next(self.action_history_proj.parameters()).dtype
         tokens = self.action_history_proj(flat.to(device=device, dtype=proj_dtype)).to(dtype=dtype)
         return tokens + self.type_embed[4].view(1, 1, -1).to(dtype=dtype)
+
+    def _coerce_grouped_history_tokens(
+        self,
+        tokens: torch.Tensor,
+        *,
+        H: int,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        slot_type: int,
+        name: str,
+    ) -> torch.Tensor:
+        """Validate an already embedded grouped-history stream.
+
+        The caller owns semantic/group/time encoding.  The predictor only
+        applies its slot identity offset, exactly as it does after the legacy
+        flat projectors.
+        """
+
+        if tokens.ndim != 3 or tokens.shape[0] != batch_size:
+            raise ValueError(
+                f"{name} must be [B,H,{self.d_model}], got {tuple(tokens.shape)}."
+            )
+        if tokens.shape[-1] != self.d_model:
+            raise ValueError(
+                f"{name} width {tokens.shape[-1]} mismatches d_model={self.d_model}."
+            )
+        if tokens.shape[1] > H:
+            tokens = tokens[:, -H:]
+        elif tokens.shape[1] < H:
+            raise ValueError(
+                f"{name} has {tokens.shape[1]} steps but visual history has {H}; "
+                "grouped history must be aligned explicitly before the predictor."
+            )
+        tokens = tokens.to(device=device, dtype=dtype)
+        return tokens + self.type_embed[slot_type].view(1, 1, -1).to(dtype=dtype)
 
     def _visual_type_embed(
         self,
@@ -1333,7 +1411,10 @@ class GAMFuturePredictor(nn.Module):
         return mask.unsqueeze(0).unsqueeze(0)
 
     def _get_flex_block_mask(self, H: int, V: int, device: torch.device, lang_len: int = 0):
-        if not _HAS_FLEX:
+        # PyTorch exposes flex_attention on CPU, but the compiled kernel is a
+        # CUDA path and currently fails during Inductor lowering.  CPU tests
+        # and preprocessing use the exact dense block-causal mask instead.
+        if not _HAS_FLEX or device.type != "cuda":
             return None
         tokens_per_step = V * self.visual_tokens_per_view + 2
         L_steps = H * tokens_per_step
@@ -1392,6 +1473,8 @@ class GAMFuturePredictor(nn.Module):
         proprio: Optional[torch.Tensor] = None,
         proprio_history: Optional[torch.Tensor] = None,     # (B, H, proprio_dim)
         past_action_history: Optional[torch.Tensor] = None, # (B, H, chunk, action_dim)
+        proprio_token_embeddings: Optional[torch.Tensor] = None,     # (B, H, d_model)
+        past_action_token_embeddings: Optional[torch.Tensor] = None, # (B, H, d_model)
         lang_feats: Optional[torch.Tensor] = None,
         lang_padding_mask: Optional[torch.Tensor] = None,
         context_valid_mask: Optional[torch.Tensor] = None,  # (B, H) bool
@@ -1430,6 +1513,7 @@ class GAMFuturePredictor(nn.Module):
         proprio_tokens = self._embed_proprio_history(
             proprio=proprio,
             proprio_history=proprio_history,
+            proprio_token_embeddings=proprio_token_embeddings,
             H=H,
             batch_size=b,
             device=device,
@@ -1437,6 +1521,7 @@ class GAMFuturePredictor(nn.Module):
         ).unsqueeze(2)   # (B, H, 1, d_model)
         action_history_tokens = self._embed_action_history(
             past_action_history=past_action_history,
+            past_action_token_embeddings=past_action_token_embeddings,
             H=H,
             batch_size=b,
             device=device,
@@ -1654,6 +1739,12 @@ class GAMFuturePredictor(nn.Module):
             .to(past_visual_tokens.dtype)
         )                                                                       # (B, H, V, d_da3)
         s_next_all = self.future_proprio_proj(proprio_h_norm).to(past_visual_tokens.dtype)
+        next_proprio_token_all = self.future_proprio_token_proj(
+            proprio_h_norm
+        ).to(past_visual_tokens.dtype)
+        next_action_history_token_all = self.future_action_history_token_proj(
+            action_h
+        ).to(past_visual_tokens.dtype)
         if view_keep is not None:
             z_next_all = z_next_all * view_keep[:, :, :, None, None].to(dtype=z_next_all.dtype)
             action_token_all = action_token_all * view_keep[:, :, :, None].to(
@@ -1678,6 +1769,8 @@ class GAMFuturePredictor(nn.Module):
         return {
             "predicted_next_visual_tokens": z_next_all,
             "predicted_next_proprio": s_next_all,
+            "predicted_next_proprio_tokens": next_proprio_token_all,
+            "predicted_next_action_history_tokens": next_action_history_token_all,
             "predicted_action_tokens": action_token_all,
             "encoded_prev_action_tokens": action_history_h,
             "encoded_proprio_tokens": proprio_h,
@@ -1777,6 +1870,7 @@ class GAMFuturePredictor(nn.Module):
         proprio_tokens = self._embed_proprio_history(
             proprio=None,
             proprio_history=new_proprio,
+            proprio_token_embeddings=None,
             H=1,
             batch_size=b,
             device=device,
@@ -1784,6 +1878,7 @@ class GAMFuturePredictor(nn.Module):
         )  # (B, 1, d_model)
         action_history_tokens = self._embed_action_history(
             past_action_history=new_prev_action,
+            past_action_token_embeddings=None,
             H=1,
             batch_size=b,
             device=device,

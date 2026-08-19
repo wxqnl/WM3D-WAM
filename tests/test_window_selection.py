@@ -96,3 +96,20 @@ def test_window_rejects_invalid_explicit_future_offsets() -> None:
             minimum_horizon_coverage=0.8,
             future_offsets_s=[0.2, 0.9],
         )
+
+
+def test_window_reserves_a_real_leading_boundary_at_episode_start() -> None:
+    clock = np.arange(26, dtype=np.float64) * 0.2
+    result = select_observed_world_window(
+        clock,
+        anchor_index=16,
+        context_samples=16,
+        future_samples=8,
+        context_horizon_s=3.2,
+        future_horizon_s=1.6,
+        minimum_horizon_coverage=0.9,
+        future_offsets_s=np.arange(1, 9) * 0.2,
+    )
+    assert result.leading_boundary_index == 0
+    assert result.context_indices[0] == 1
+    assert result.context_indices[-1] == 16

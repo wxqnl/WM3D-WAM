@@ -25,6 +25,9 @@ stages:
     steps: 40000
     warmup_steps: 2000
     program_mix: {action_only: 0.5, forward_world: 0.3, joint_world_action: 0.2}
+    parameter_stages:
+      warmup: wan_action_warmup
+      main: wan_action_main
   tri_stream_alignment:
     steps: 20000
     program_mix: {action_only: 0.4, forward_world: 0.3, joint_world_action: 0.3}

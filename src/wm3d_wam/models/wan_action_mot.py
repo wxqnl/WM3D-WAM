@@ -170,6 +170,81 @@ class WanActionMoT(nn.Module):
             for layer, payload in geometry_kv.items()
         }
 
+    def _prefill_prepared_video(
+        self,
+        *,
+        state: dict[str, Any],
+        token_mask: torch.Tensor,
+        geometry_tokens: Optional[torch.Tensor],
+        geometry_token_mask: Optional[torch.Tensor],
+    ) -> ObservedVideoKVCache:
+        shared_self_mask = self.video_expert.build_video_to_video_mask(
+            video_seq_len=int(state["tokens"].shape[1]),
+            video_tokens_per_frame=int(state["meta"]["tokens_per_frame"]),
+            device=state["tokens"].device,
+        )
+        batch_self_mask = (
+            shared_self_mask.unsqueeze(0)
+            & token_mask.unsqueeze(1)
+            & token_mask.unsqueeze(2)
+        ).unsqueeze(1)
+        geometry_kv = self._prepare_geometry_kv(
+            geometry_tokens=geometry_tokens,
+            geometry_token_mask=geometry_token_mask,
+            query_token_mask=token_mask,
+        )
+        layers = self.mot.prefill_video_cache(
+            video_tokens=state["tokens"],
+            video_freqs=state["freqs"],
+            video_t_mod=state["t_mod"],
+            video_context_payload={
+                "context": state["context"],
+                "mask": state["context_mask"],
+            },
+            video_attention_mask=batch_self_mask,
+            extra_kv_all=geometry_kv,
+        )
+        return ObservedVideoKVCache(
+            layers=layers,
+            token_mask=token_mask,
+            tokens_per_frame=int(state["meta"]["tokens_per_frame"]),
+            geometry_kv=geometry_kv,
+            geometry_token_mask=geometry_token_mask,
+        )
+
+    def _action_velocity_from_prepared_cache(
+        self,
+        *,
+        state: dict[str, Any],
+        action_batch: GroupedActionBatch,
+        cache: ObservedVideoKVCache,
+    ) -> torch.Tensor:
+        attention_mask = build_mot_attention_mask(
+            program=InteractionProgram.ACTION_ONLY,
+            video_token_mask=cache.token_mask,
+            action_event_mask=action_batch.event_mask,
+            video_tokens_per_frame=cache.tokens_per_frame,
+        )
+        geometry_kv = self._retarget_geometry_kv(
+            cache.geometry_kv,
+            geometry_token_mask=cache.geometry_token_mask,
+            query_token_mask=action_batch.event_mask,
+        )
+        tokens = self.mot.forward_action_with_video_cache(
+            action_tokens=state["tokens"],
+            action_freqs=state["freqs"],
+            action_t_mod=state["t_mod"],
+            action_context_payload={
+                "context": state["context"],
+                "mask": state["context_mask"],
+            },
+            video_kv_cache=cache.layers,
+            attention_mask=attention_mask,
+            video_seq_len=cache.sequence_length,
+            extra_kv_all=geometry_kv,
+        )
+        return self.action_expert.post_dit(tokens, state)
+
     def forward(
         self,
         *,
@@ -208,10 +283,32 @@ class WanActionMoT(nn.Module):
                 "action_only accepts exactly one observed Wan latent frame; "
                 "future video must not enter the policy path"
             )
+        if mode is InteractionProgram.ACTION_ONLY and bool(
+            (video_timestep != 0).any()
+        ):
+            raise ValueError("action_only observed-video timestep must be zero")
 
         video_mask = self._video_token_mask(
             video_state["tokens"], video_token_mask
         )
+        if mode is InteractionProgram.ACTION_ONLY:
+            cache = self._prefill_prepared_video(
+                state=video_state,
+                token_mask=video_mask,
+                geometry_tokens=geometry_tokens,
+                geometry_token_mask=geometry_token_mask,
+            )
+            action_velocity = self._action_velocity_from_prepared_cache(
+                state=action_state,
+                action_batch=action_batch,
+                cache=cache,
+            )
+            return WanActionOutput(
+                video_velocity=None,
+                action_velocity=action_velocity,
+                video_pre_state=video_state,
+                action_pre_state=action_state,
+            )
         video_self = self.video_expert.build_video_to_video_mask(
             video_seq_len=int(video_state["tokens"].shape[1]),
             video_tokens_per_frame=int(video_state["meta"]["tokens_per_frame"]),
@@ -308,37 +405,10 @@ class WanActionMoT(nn.Module):
             fuse_vae_embedding_in_latents=True,
         )
         token_mask = self._video_token_mask(state["tokens"], video_token_mask)
-        shared_self_mask = self.video_expert.build_video_to_video_mask(
-            video_seq_len=int(state["tokens"].shape[1]),
-            video_tokens_per_frame=int(state["meta"]["tokens_per_frame"]),
-            device=state["tokens"].device,
-        )
-        batch_self_mask = (
-            shared_self_mask.unsqueeze(0)
-            & token_mask.unsqueeze(1)
-            & token_mask.unsqueeze(2)
-        ).unsqueeze(1)
-        geometry_kv = self._prepare_geometry_kv(
-            geometry_tokens=geometry_tokens,
-            geometry_token_mask=geometry_token_mask,
-            query_token_mask=token_mask,
-        )
-        layers = self.mot.prefill_video_cache(
-            video_tokens=state["tokens"],
-            video_freqs=state["freqs"],
-            video_t_mod=state["t_mod"],
-            video_context_payload={
-                "context": state["context"],
-                "mask": state["context_mask"],
-            },
-            video_attention_mask=batch_self_mask,
-            extra_kv_all=geometry_kv,
-        )
-        return ObservedVideoKVCache(
-            layers=layers,
+        return self._prefill_prepared_video(
+            state=state,
             token_mask=token_mask,
-            tokens_per_frame=int(state["meta"]["tokens_per_frame"]),
-            geometry_kv=geometry_kv,
+            geometry_tokens=geometry_tokens,
             geometry_token_mask=geometry_token_mask,
         )
 
@@ -359,28 +429,8 @@ class WanActionMoT(nn.Module):
             context=context,
             context_mask=context_mask,
         )
-        attention_mask = build_mot_attention_mask(
-            program=InteractionProgram.ACTION_ONLY,
-            video_token_mask=cache.token_mask,
-            action_event_mask=action_batch.event_mask,
-            video_tokens_per_frame=cache.tokens_per_frame,
+        return self._action_velocity_from_prepared_cache(
+            state=state,
+            action_batch=action_batch,
+            cache=cache,
         )
-        geometry_kv = self._retarget_geometry_kv(
-            cache.geometry_kv,
-            geometry_token_mask=cache.geometry_token_mask,
-            query_token_mask=action_batch.event_mask,
-        )
-        tokens = self.mot.forward_action_with_video_cache(
-            action_tokens=state["tokens"],
-            action_freqs=state["freqs"],
-            action_t_mod=state["t_mod"],
-            action_context_payload={
-                "context": state["context"],
-                "mask": state["context_mask"],
-            },
-            video_kv_cache=cache.layers,
-            attention_mask=attention_mask,
-            video_seq_len=cache.sequence_length,
-            extra_kv_all=geometry_kv,
-        )
-        return self.action_expert.post_dit(tokens, state)

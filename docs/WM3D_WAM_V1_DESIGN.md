@@ -2,7 +2,7 @@
 
 | 项目 | 内容 |
 |---|---|
-| 状态 | Revision 2，M1 实现中 |
+| 状态 | Revision 2，M2/M3 生产宽度 preflight 完成，正式训练门禁中 |
 | 日期 | 2026-08-19 |
 | 目标仓库 | wxqnl/WM3D-WAM |
 | 当前分支 | codex/implement-wm3d-wam-v1 |
@@ -32,7 +32,7 @@ Revision 1 有三个需要改正的设计点：
 
 - 当前 21 个 source、547,382 个上游 train-labeled 可用 episode、11,034,768 个候选窗口的统计可信，可继续作为容量基线。
 - 上游 train 标签不是 WM3D-WAM 的最终 train/val/test。最终划分必须在 episode 或 parent trajectory 层完成，绝不在 window 层划分。
-- 全部 source 的训练视频统一成 5 Hz、9 帧、1.6 秒。5/10/15/20 Hz 分别使用 stride 1/2/3/4，全部选择真实帧，不插帧。
+- 全部 source 的训练视频统一成 5 Hz、9 帧、1.6 秒。按 recorded timestamp 选择最接近目标时刻的真实帧；对均匀 5/10/15/20 Hz 数据分别等价于 stride 1/2/3/4，不插帧。
 - Action 不随视频降采样。1.6 秒内分别保留 8/16/24/32 个原生控制事件及其真实时间戳。
 - 训练集物理划分与训练采样比例分开管理。物理划分固定；OXE 与 RoboCasa 的采样权重按 objective 改变。
 
@@ -954,6 +954,12 @@ Grouped Robot ABI、连续时间和 geometry adapter 是本项目新增，不能
 - 完成 Action coupling、5/10 Hz、future-aware 等关键消融；
 - 冻结 v1 inference program。
 
+当前实现状态：M1 的 episode split、timestamp window 和在线 decode 已完成，
+但 21 个 source 的控制语义审计尚未完成；M2/M3 的单卡生产宽度计算图、三种
+interaction program、Stage A 与 Stage B preflight 已完成。正式长训、七卡
+FSDP canary、checkpoint resume 和评测仍属于后续门禁。具体证据见
+[EXPERIMENTS.md](EXPERIMENTS.md)。
+
 ## 15. 主要风险
 
 | 风险 | 影响 | 处理 |
@@ -967,7 +973,7 @@ Grouped Robot ABI、连续时间和 geometry adapter 是本项目新增，不能
 | 低分辨率大源拖低视频 | 模糊和伪影 | Tier B 半权重，Tier C 不做 Wan loss |
 | VGGT 深层破坏预训练几何 | depth/camera 退化 | shallow 冻结、deep 低学习率、Stage A 门禁 |
 | 七卡显存不足 | OOM 或吞吐极低 | FSDP full shard、checkpointing、micro batch 1、稀疏 geometry adapters |
-| Wan 权重缺失 | Stage B 无法开始 | M1 前放入服务器只读资产目录并做 shape 检查 |
+| 七卡训练状态恢复未验证 | 长训中断后无法精确续跑 | FSDP canary 同时核对模型、optimizer、scheduler、sampler cursor 与 RNG 恢复 |
 
 ## 16. 默认配置摘要
 

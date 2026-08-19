@@ -44,5 +44,6 @@ def test_runtime_forbids_gpu_zero_and_geometry_bridge_is_a_hard_gate() -> None:
     assert list(runtime.runtime.forbidden_cuda_devices) == [0]
     assert (
         geometry.future_predictor.integration_status
-        == "grouped_history_bridge_required"
+        == "grouped_history_bridge_implemented"
     )
+    assert geometry.history_connector._target_ == "wm3d_wam.models.GroupedHistoryConnector"
