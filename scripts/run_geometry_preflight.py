@@ -13,6 +13,7 @@ import torch
 
 from wm3d_wam.assets import encode_local_wan_prompts, load_local_wan_components
 from wm3d_wam.data.online_episode import first_eligible_episode, load_online_robot_window
+from wm3d_wam.data.source_contracts import NormalizationRegistry, SourceContractRegistry
 from wm3d_wam.models.factory import build_online_geometry_core, load_yaml_mapping
 from wm3d_wam.training.geometry_pipeline import GeometryPretrainingPipeline
 from wm3d_wam.training.parameter_groups import (
@@ -31,8 +32,11 @@ def main() -> None:
     parser.add_argument("--source-root", required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--adapter", required=True)
-    parser.add_argument("--source-hz", type=int, required=True)
-    parser.add_argument("--embodiment-id", type=int, required=True)
+    parser.add_argument("--source-contracts", default="configs/data/source_contracts_v1.yaml")
+    parser.add_argument(
+        "--normalization",
+        default="/data/Minko/wm3d_formal_1b_raw_100k_3f056a4_20260816/grouped_normalization_1b.json",
+    )
     parser.add_argument("--wan-assets", required=True)
     parser.add_argument("--vggt-checkpoint", required=True)
     parser.add_argument("--vggt-source-root", required=True)
@@ -52,15 +56,19 @@ def main() -> None:
     device = torch.device("cuda:0")
     dtype = torch.bfloat16
 
-    minimum_rows = (16 + 8) * (args.source_hz // 5) + 1
+    contracts = SourceContractRegistry.load(args.source_contracts)
+    normalization = NormalizationRegistry.load(args.normalization)
+    source_name = Path(args.manifest).stem
+    contract = contracts.require(source_name)
+    minimum_rows = (16 + 8) * (contract.source_hz // 5) + 1
     start = time.perf_counter()
     episode = first_eligible_episode(Path(args.manifest), minimum_rows=minimum_rows)
     window = load_online_robot_window(
         source_root=Path(args.source_root),
         adapter_path=Path(args.adapter),
         episode=episode,
-        embodiment_id=args.embodiment_id,
-        source_hz=args.source_hz,
+        source_contract=contract,
+        normalization=normalization,
     )
     data_seconds = time.perf_counter() - start
     model_config = load_yaml_mapping(args.model_config)

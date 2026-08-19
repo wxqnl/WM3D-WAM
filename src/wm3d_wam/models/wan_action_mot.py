@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import torch
 import torch.nn as nn
@@ -52,14 +52,29 @@ class WanActionMoT(nn.Module):
         mot_checkpoint_mixed_attn: bool = True,
     ) -> None:
         super().__init__()
-        self.video_expert = video_expert
-        self.action_expert = action_expert
         self.geometry_adapters = geometry_adapters
-        self._validate_expert_layout()
         self.mot = MoT(
             mixtures={"video": video_expert, "action": action_expert},
             mot_checkpoint_mixed_attn=mot_checkpoint_mixed_attn,
         )
+        self._validate_expert_layout()
+
+    @property
+    def video_expert(self) -> WanVideoDiT:
+        """Return the sole registered video-expert instance.
+
+        ``MoT.mixtures`` owns both experts. Registering aliases on this module
+        creates duplicate state-dict paths for the same parameters, which is
+        unsafe for FSDP/DCP collective state-dict construction.
+        """
+
+        return cast(WanVideoDiT, self.mot.mixtures["video"])
+
+    @property
+    def action_expert(self) -> GroupedActionFlowExpert:
+        """Return the sole registered grouped-action expert instance."""
+
+        return cast(GroupedActionFlowExpert, self.mot.mixtures["action"])
 
     def _validate_expert_layout(self) -> None:
         if len(self.video_expert.blocks) != len(self.action_expert.blocks):

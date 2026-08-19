@@ -295,8 +295,8 @@ class OnlineVGGTGeometryCore(nn.Module):
         )
         if observed_steps != len(self.observed_keyframe_indices):
             raise ValueError("observed image count must match configured keyframes")
-        if views != self.encoder.views_per_timestep:
-            raise ValueError("observed view count must match the VGGT encoder bucket")
+        if not 1 <= views <= 3:
+            raise ValueError("WM3D-WAM supports one to three real views per sample")
         if observed_images.shape[-2:] != (
             self.encoder.encoder_input_size,
             self.encoder.encoder_input_size,

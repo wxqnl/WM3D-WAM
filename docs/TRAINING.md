@@ -1,8 +1,7 @@
-# WM3D-WAM 训练与资产 Runbook
+# WM3D-WAM v1 训练 Runbook
 
-本文档只描述当前仓库已经实现的入口。所有命令在 New-H100-2 的
-`/data/Minko/WM3D-WAM` 执行。GPU 0 保留给其他任务；单卡命令中的
-`CUDA_VISIBLE_DEVICES=1` 指物理 GPU 1，程序内部看到的是逻辑 `cuda:0`。
+更新日期：2026-08-20。本文档只写仓库中已经实现并通过真实数据验证的入口。
+所有命令在 New-H100-2 的 `/data/Minko/WM3D-WAM` 执行。物理 GPU 0 禁用。
 
 ## 1. 环境与本地资产
 
@@ -10,8 +9,10 @@
 ssh New-H100-2
 cd /data/Minko/WM3D-WAM
 
-export PYTHONPATH=/data/Minko/WM3D-WAM/src
+export WM3D_ROOT=/data/Minko/WM3D-WAM
 export WM3D_PYTHON=/data/Minko/.venvs/wm3d/bin/python
+export WM3D_TORCHRUN=/data/Minko/.venvs/wm3d/bin/torchrun
+export PYTHONPATH="$WM3D_ROOT/src"
 export WAN_ASSETS=/data/Minko/models/WM3D-WAM/Wan2.2-TI2V-5B
 export ACTION_BACKBONE=/data/Minko/models/WM3D-WAM/ActionDiT/ActionDiT_grouped_Wan22_1024.pt
 export VGGT_CKPT=/data/Minko/world_model/wm3d_v8_action_experiments/gam_node42_v1/assets/vggt_model.safetensors
@@ -21,38 +22,32 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 ```
 
-训练 worker 对 Wan bundle、Action backbone、VGGT checkpoint 和 VGGT source
-使用严格本地路径。缺文件、checkpoint key 不一致或 meta-device runtime
-constant 未物化时直接失败，不在 worker 内下载模型。训练读取原始 Parquet 和
-MP4；不要求 VGGT、depth、point、pose 或 Wan latent cache。
+Worker 只从本地读取 Wan2.2 DiT、VAE、UMT5、tokenizer、ActionDiT backbone、
+VGGT checkpoint、Parquet 和 MP4。缺失资产、checkpoint key 不匹配、未物化的
+meta-device 常量都会立即报错。训练不需要 VGGT、depth、point、pose 或 Wan
+latent 缓存。
 
-当前 Wan bundle 必须同时包含：
+## 2. 数据门禁
 
-- Wan2.2 DiT safetensor shards；
-- `Wan2.2_VAE.pth`；
-- `models_t5_umt5-xxl-enc-bf16.pth`；
-- `google/umt5-xxl/` tokenizer 目录。
+`configs/data/source_contracts_v1.yaml` 为 21 个 source 提供显式合同。正式
+sampler 只接纳 7 个 `verified` source：
 
-## 2. 一次性准备
+| source | Hz | train | val | test |
+|---|---:|---:|---:|---:|
+| oxe_bridge | 5 | 20,690 | 211 | 211 |
+| oxe_droid | 15 | 83,209 | 849 | 849 |
+| oxe_furniture_bench | 10 | 2,365 | 24 | 24 |
+| oxe_bc_z | 10 | 14,056 | 143 | 143 |
+| robocasa_atomic | 20 | 5,999 | 61 | 61 |
+| robocasa_composite | 20 | 15,921 | 162 | 162 |
+| robocasa_mg | 20 | 385,407 | 3,933 | 3,933 |
+| 合计 |  | 527,647 | 5,383 | 5,383 |
 
-ActionDiT backbone 已存在时不要重复生成。需要重建时，先确认物理 GPU 1
-空闲，再执行：
+其余 14 个 source 保留 split 与统计，但 `status: excluded`，不会进入训练。
+加入它们之前必须从当前本地 payload 证明 action/state 的单位、坐标系、
+composition operator 和 gripper polarity。代码不会用通用语义代替缺失合同。
 
-```bash
-nvidia-smi -i 1 --query-gpu=index,memory.used,utilization.gpu --format=csv
-CUDA_VISIBLE_DEVICES=1 "$WM3D_PYTHON" scripts/prepare_grouped_action_backbone.py \
-  --asset-root "$WAN_ASSETS" \
-  --model-config configs/model/wan_action_mot_v1.yaml \
-  --output "$ACTION_BACKBONE" \
-  --device cuda \
-  --dtype bfloat16
-```
-
-该脚本只迁移 Wan 与 ActionDiT 共享的 30 层 backbone。shape 相同的 tensor
-直接复制，shape 不同的 tensor 使用 FastWAM 的逐维线性插值与 alpha scaling；
-grouped codec 和输出层由本模型初始化。
-
-固定 episode split 的物化命令：
+重新物化固定 episode split：
 
 ```bash
 "$WM3D_PYTHON" scripts/build_episode_splits.py \
@@ -61,119 +56,171 @@ grouped codec 和输出层由本模型初始化。
   --seed 20260819
 ```
 
-输出包括 `train/`、`val/`、`test/` 下逐 source ID 列表、全局
-`episode_split_index.jsonl` 和 `summary.json`。同一个 parent trajectory（若
-manifest 提供）不会跨 split；否则以 episode 为不可分单位。没有可信离散 task
-ID 时不物化严格 task-OOD split。
+同一 parent trajectory 在 manifest 提供该字段时不会跨 split；否则 episode 是
+最小划分单位。window 只继承 episode split，训练时不临时重划。
 
 ## 3. CPU 合同测试
 
 ```bash
-PYTHONPATH=src "$WM3D_PYTHON" -m pytest -q
+CUDA_VISIBLE_DEVICES="" PYTHONPATH=src \
+  "$WM3D_PYTHON" -m pytest -q
 ```
 
-当前预期为 48 项通过。测试覆盖张量合同、时间选择、split、mask、flow、cache
-路径和参数归属；它不替代真实权重、真实视频上的 GPU preflight。
+当前预期为 59 项通过。覆盖 source gate、时间窗、原生 action event、grouped
+ABI、三种 interaction mask、在线 VGGT-GAM、Wan/Action MoT、分层 sampler、
+FSDP checkpoint 合同、精确恢复和 checkpoint 保留策略。
 
-## 4. 真实 Bridge preflight
+## 4. 分布式运行合同
 
-先定义同一个真实 source 的参数：
+当前验证过的完整模型 mesh 是物理 GPU `1,2,5,6,7`：
 
 ```bash
-export SOURCE_ROOT=/shared/Minko/datasets/gam_stage1/openx_lerobot/BrunoM42/bridge_orig_lerobot
-export SOURCE_MANIFEST=/data/Minko/wm3d_formal_1b_raw_100k_3f056a4_20260816/manifests/oxe_bridge.jsonl
-export SOURCE_ADAPTER=/data/Minko/wm3d_formal_1b_raw_100k_3f056a4_20260816/contracts/adapters/oxe_bridge.yaml
+nvidia-smi -i 1,2,5,6,7 \
+  --query-gpu=index,memory.used,utilization.gpu \
+  --format=csv
+export CUDA_VISIBLE_DEVICES=1,2,5,6,7
 ```
 
-每次启动前都应再次检查所用物理卡；下面只使用物理 GPU 1：
+运行时允许显式列出物理 GPU 1–7 的任意非空子集，拒绝 GPU 0、重复 ID、UUID
+写法和越界 ID。当前五卡配置使用 BF16 forward/reduce、FP32 master weights、
+FSDP FULL_SHARD、每卡 micro-batch 1、gradient accumulation 4，有效 global
+batch 为 20。node 42 的 NCCL NVLS 多 rank 路径存在驱动错误，launcher 默认
+设置 `NCCL_NVLS_ENABLE=0`，使用已验证的普通 NVLink collective。
 
-```bash
-nvidia-smi -i 1 --query-gpu=index,memory.used,utilization.gpu --format=csv
-```
+每个 rank 在进入 FSDP forward 前交换数据读取状态。某个 worker 解码失败时，
+所有 rank 一起退出并报告原始数据错误，不会把其他 rank 留在 NCCL collective
+中。
 
-Stage A 在线 Geometry-GAM forward/backward：
+## 5. Checkpoint 合同
 
-```bash
-CUDA_VISIBLE_DEVICES=1 "$WM3D_PYTHON" scripts/run_geometry_preflight.py \
-  --physical-gpu 1 \
-  --source-root "$SOURCE_ROOT" \
-  --manifest "$SOURCE_MANIFEST" \
-  --adapter "$SOURCE_ADAPTER" \
-  --source-hz 5 \
-  --embodiment-id 0 \
-  --wan-assets "$WAN_ASSETS" \
-  --vggt-checkpoint "$VGGT_CKPT" \
-  --vggt-source-root "$VGGT_SOURCE_ROOT" \
-  --backward \
-  --output outputs/preflight/final_bridge_geometry_stage_a.json
-```
-
-完整 action-only online path、反向、部署 cache parity 与 target leakage：
-
-```bash
-CUDA_VISIBLE_DEVICES=1 "$WM3D_PYTHON" scripts/run_pipeline_preflight.py \
-  --physical-gpu 1 \
-  --program action_only \
-  --stage wan_action_warmup \
-  --source-root "$SOURCE_ROOT" \
-  --manifest "$SOURCE_MANIFEST" \
-  --adapter "$SOURCE_ADAPTER" \
-  --source-hz 5 \
-  --embodiment-id 0 \
-  --wan-assets "$WAN_ASSETS" \
-  --action-backbone "$ACTION_BACKBONE" \
-  --vggt-checkpoint "$VGGT_CKPT" \
-  --vggt-source-root "$VGGT_SOURCE_ROOT" \
-  --backward \
-  --cache-parity \
-  --target-leakage \
-  --output outputs/preflight/final_bridge_action_only.json
-```
-
-`run_pipeline_preflight.py` 还接受：
-
-| program | 输入噪声与主监督 | 用途 |
+| phase | 存储 | 恢复约束 |
 |---|---|---|
-| `action_only` | noisy future action；observed video 只做 K/V prefill | 部署策略路径 |
-| `forward_world` | clean candidate action + noisy future video | action-conditioned world model |
-| `joint_world_action` | noisy future action + noisy future video | 双流联合对齐 |
+| `geometry_gam` | canonical DTensor DCP | 可重分片，并可初始化完整模型 |
+| Stage B/C | rank-local FSDP flat shard | world size 与有序物理 GPU mesh 必须相同 |
 
-`--backward-loss action` 或 `--backward-loss video` 可隔离单个 objective 做梯度
-归因；`--optimizer-steps 3` 在固定真实窗口、固定 timestep/noise 上执行短拟合。
-完整生产训练不能用单样本 preflight 替代。
+checkpoint 包含 model、optimizer、scheduler、每 rank 的 Python/NumPy/CPU/CUDA
+RNG 和已提交 sampler cursor。程序先写全部 tensor 与 runtime payload，最后写
+`metadata.json` 完成标记，再原子更新 `latest.txt`。恢复不会使用 DataLoader
+预取位置，因此不会跳样本。
 
-## 5. Stage 参数归属
+完整 Stage B-main/C checkpoint 在五卡上约 91 GiB。以下正式命令每 5,000 步
+保存一次，并显式设置 `--keep-last-checkpoints 2`。清理只删除更老且拥有合法
+完成标记的编号目录；默认值 0 不自动删除任何 checkpoint。
 
-`configure_stage_parameter_groups` 先冻结全系统，再显式启用下表参数，并检查每个
-trainable parameter 恰好属于一个 optimizer group。
+## 6. 正式训练命令
 
-| stage | trainable group | learning rate |
-|---|---|---:|
-| `geometry_gam` | geometry predictor/history/aux heads | 1e-5 |
-| `geometry_gam` | VGGT deep pairs 4–23 | 1e-5 |
-| `wan_action_warmup` | geometry predictor/history/aux heads | 1e-5 |
-| `wan_action_warmup` | Action Expert | 2e-5 |
-| `wan_action_warmup` | sparse geometry adapters | 1e-5 |
-| `wan_action_main` | 上述三组 | 1e-5 / 2e-5 / 1e-5 |
-| `wan_action_main` | VGGT deep pairs 4–23 | 5e-6 |
-| `wan_action_main` | Wan DiT | 2e-6 |
-| `tri_stream_alignment` | geometry / Action / adapter / VGGT deep / Wan | 5e-6 / 1e-5 / 1e-5 / 5e-6 / 1e-6 |
+以下四个 output 目录在首次启动前必须不存在。Stage A、Stage B warmup、Stage B
+main 和 Stage C 的 `max_steps` 都是各自 phase 内的步数。
 
-Wan VAE、UMT5、tokenizer、VGGT pairs 0–3 和 VGGT geometry heads 不进入
-optimizer。全局 optimizer 配置是 AdamW、betas `(0.9, 0.95)`、weight decay
-`0.01`、gradient clipping `1.0`。
+### 6.1 Stage A：Geometry-GAM，30,000 步
 
-## 6. 正式训练门禁
+```bash
+"$WM3D_TORCHRUN" --standalone --nproc_per_node=5 \
+  scripts/train_wm3d_wam.py \
+  --phase geometry_gam \
+  --max-steps 30000 \
+  --warmup-steps 500 \
+  --gradient-accumulation-steps 4 \
+  --num-workers 4 \
+  --log-interval 10 \
+  --validation-interval 500 \
+  --validation-samples-per-rank 8 \
+  --checkpoint-interval 5000 \
+  --keep-last-checkpoints 2 \
+  --output-dir outputs/train/wm3d_wam_v1/stage_a_geometry
+```
 
-单卡生产宽度 forward/backward、三种 interaction program、短拟合和双向梯度
-耦合已经通过，数值见 [EXPERIMENTS.md](EXPERIMENTS.md)。在跨 source 正式长训
-之前仍需完成两件事：
+### 6.2 Stage B warmup：Action/geometry，2,000 步
 
-1. 逐 source 确认 action/state 的单位、坐标系、composition operator 与
-   gripper polarity；当前若干 v4 adapter 仍只有通用
-   `controller_command/controller_state` 语义。
-2. 实现并运行七卡 FSDP canary，验证吞吐、编号 checkpoint 以及 model、
-   optimizer、scheduler、sampler cursor 和 RNG 的精确恢复。
+```bash
+"$WM3D_TORCHRUN" --standalone --nproc_per_node=5 \
+  scripts/train_wm3d_wam.py \
+  --phase wan_action_warmup \
+  --max-steps 2000 \
+  --warmup-steps 200 \
+  --gradient-accumulation-steps 4 \
+  --num-workers 4 \
+  --log-interval 10 \
+  --validation-interval 500 \
+  --validation-samples-per-rank 8 \
+  --checkpoint-interval 1000 \
+  --keep-last-checkpoints 2 \
+  --initialize-from outputs/train/wm3d_wam_v1/stage_a_geometry/checkpoints \
+  --output-dir outputs/train/wm3d_wam_v1/stage_b_warmup
+```
 
-因此 `configs/train/wm3d_wam_v1.yaml` 中的七卡参数是冻结的目标合同，不应在
-缺少 launcher/resume canary 时被解释为已完成的正式训练入口。
+### 6.3 Stage B main：解冻 Wan/VGGT deep，38,000 步
+
+```bash
+"$WM3D_TORCHRUN" --standalone --nproc_per_node=5 \
+  scripts/train_wm3d_wam.py \
+  --phase wan_action_main \
+  --max-steps 38000 \
+  --warmup-steps 500 \
+  --gradient-accumulation-steps 4 \
+  --num-workers 4 \
+  --log-interval 10 \
+  --validation-interval 500 \
+  --validation-samples-per-rank 8 \
+  --checkpoint-interval 5000 \
+  --keep-last-checkpoints 2 \
+  --initialize-from outputs/train/wm3d_wam_v1/stage_b_warmup/checkpoints \
+  --output-dir outputs/train/wm3d_wam_v1/stage_b_main
+```
+
+### 6.4 Stage C：Tri-stream alignment，20,000 步
+
+```bash
+"$WM3D_TORCHRUN" --standalone --nproc_per_node=5 \
+  scripts/train_wm3d_wam.py \
+  --phase tri_stream_alignment \
+  --max-steps 20000 \
+  --warmup-steps 500 \
+  --gradient-accumulation-steps 4 \
+  --num-workers 4 \
+  --log-interval 10 \
+  --validation-interval 500 \
+  --validation-samples-per-rank 8 \
+  --checkpoint-interval 5000 \
+  --keep-last-checkpoints 2 \
+  --initialize-from outputs/train/wm3d_wam_v1/stage_b_main/checkpoints \
+  --output-dir outputs/train/wm3d_wam_v1/stage_c_tri_stream
+```
+
+Stage B warmup、main 和 Stage C 必须使用相同的
+`CUDA_VISIBLE_DEVICES=1,2,5,6,7` 顺序。参数 stage 的学习率与可训练模块由
+`src/wm3d_wam/training/parameter_groups.py` 唯一决定；CLI 不接受临时覆盖。
+
+## 7. 精确恢复与计划停机
+
+恢复时复用原 phase、max steps、seed、gradient accumulation、output 目录和有序
+GPU mesh，把 `--initialize-from` 改成 `--resume`：
+
+```bash
+"$WM3D_TORCHRUN" --standalone --nproc_per_node=5 \
+  scripts/train_wm3d_wam.py \
+  --phase wan_action_main \
+  --max-steps 38000 \
+  --warmup-steps 500 \
+  --gradient-accumulation-steps 4 \
+  --num-workers 4 \
+  --log-interval 10 \
+  --validation-interval 500 \
+  --validation-samples-per-rank 8 \
+  --checkpoint-interval 5000 \
+  --keep-last-checkpoints 2 \
+  --resume outputs/train/wm3d_wam_v1/stage_b_main/checkpoints \
+  --output-dir outputs/train/wm3d_wam_v1/stage_b_main
+```
+
+`--stop-after-step N` 会在 phase-local step N 做验证、保存完整 checkpoint 并以
+`paused.json` 退出。它适合维护窗口，不改变 `max_steps`，之后按上面的 resume
+命令继续。
+
+## 8. 已完成门禁
+
+真实权重、真实 MP4/Parquet 上已经完成：单卡三种 program 与梯度归因；Stage A
+双卡 canonical DCP 保存及精确恢复；Stage B warmup 五卡保存、恢复和三种 route；
+Stage B main 五卡深层解冻；Stage C 五卡 train、validation 和完整 checkpoint。
+数值与输出目录见 [EXPERIMENTS.md](EXPERIMENTS.md)。这些门禁证明训练 pipeline
+能运行和恢复，不代表下游策略质量已经达标。

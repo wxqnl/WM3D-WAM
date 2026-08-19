@@ -1,0 +1,508 @@
+schema: wm3d_wam_source_contracts_v1
+expected_source_count: 21
+
+# ``verified`` means that the local flattened LeRobot payload, not merely the
+# upstream dataset name, has enough evidence to assign every trained channel a
+# unit/controller space, frame, composition rule, and gripper polarity.
+sources:
+  - name: oxe_bridge
+    source_id: 0
+    family: oxe
+    embodiment: oxe_bridge_controller
+    embodiment_id: 200
+    source_hz: 5
+    raw_action_dim: 7
+    raw_state_dim: 8
+    status: verified
+    programs: [geometry_pretrain, action_only, forward_world, joint_world_action]
+    quality_weight: 0.95
+    ignored_action_indices: []
+    ignored_state_indices: [6]
+    exclusion_reason: ""
+    evidence:
+      - local LeRobot metadata names XYZ, roll-pitch-yaw, and gripper channels
+      - official Bridge controller audit establishes base-frame metric deltas
+      - local payload range audit establishes binary open-gripper polarity
+    groups:
+      - name: eef
+        group_id: 31
+        action_indices: [0, 1, 2, 3, 4, 5]
+        state_indices: [0, 1, 2, 3, 4, 5]
+        action_semantics: [delta_position_m, delta_position_m, delta_position_m, delta_rotation_euler_xyz_rad, delta_rotation_euler_xyz_rad, delta_rotation_euler_xyz_rad]
+        state_semantics: [eef_position_m, eef_position_m, eef_position_m, eef_rotation_euler_xyz_rad, eef_rotation_euler_xyz_rad, eef_rotation_euler_xyz_rad]
+        action_frame: robot_base
+        state_frame: robot_base
+        composition_operators: [sum, sum, sum, so3_euler_xyz_base_left, so3_euler_xyz_base_left, so3_euler_xyz_base_left]
+      - name: gripper
+        group_id: 32
+        action_indices: [6]
+        state_indices: [7]
+        action_semantics: [absolute_gripper_open01]
+        state_semantics: [gripper_open01]
+        action_frame: gripper_scalar
+        state_frame: gripper_scalar
+        composition_operators: [logical_last]
+        normalize_action: [false]
+        normalize_state: [false]
+
+  - name: oxe_droid
+    source_id: 1
+    family: oxe
+    embodiment: oxe_droid_controller
+    embodiment_id: 201
+    source_hz: 15
+    raw_action_dim: 8
+    raw_state_dim: 8
+    status: verified
+    programs: [geometry_pretrain, action_only, forward_world, joint_world_action]
+    quality_weight: 1.0
+    ignored_action_indices: []
+    ignored_state_indices: []
+    exclusion_reason: ""
+    evidence:
+      - local LeRobot metadata explicitly names seven joint-position targets and gripper
+      - local action and state payload ranges agree with radians and open-gripper position
+    groups:
+      - name: arm_joints
+        group_id: 33
+        action_indices: [0, 1, 2, 3, 4, 5, 6]
+        state_indices: [0, 1, 2, 3, 4, 5, 6]
+        action_semantics: [joint_position_rad, joint_position_rad, joint_position_rad, joint_position_rad, joint_position_rad, joint_position_rad, joint_position_rad]
+        state_semantics: [joint_position_rad, joint_position_rad, joint_position_rad, joint_position_rad, joint_position_rad, joint_position_rad, joint_position_rad]
+        action_frame: robot_joint_coordinates
+        state_frame: robot_joint_coordinates
+        composition_operators: [last, last, last, last, last, last, last]
+      - name: gripper
+        group_id: 32
+        action_indices: [7]
+        state_indices: [7]
+        action_semantics: [absolute_gripper_open01]
+        state_semantics: [gripper_open01]
+        action_frame: gripper_scalar
+        state_frame: gripper_scalar
+        composition_operators: [last]
+        normalize_action: [false]
+        normalize_state: [false]
+
+  - name: oxe_utaustin_mutex
+    source_id: 2
+    family: oxe
+    embodiment: oxe_utaustin_mutex_controller
+    embodiment_id: 203
+    source_hz: 20
+    raw_action_dim: 7
+    raw_state_dim: 8
+    status: excluded
+    programs: []
+    quality_weight: 1.0
+    ignored_action_indices: []
+    ignored_state_indices: []
+    exclusion_reason: local converter exposes anonymous motor columns and does not prove whether the payload was OpenVLA-standardized
+    evidence: [local LeRobot metadata audit]
+    groups: []
+
+  - name: oxe_stanford_hydra
+    source_id: 3
+    family: oxe
+    embodiment: oxe_stanford_hydra_controller
+    embodiment_id: 204
+    source_hz: 10
+    raw_action_dim: 7
+    raw_state_dim: 8
+    status: excluded
+    programs: []
+    quality_weight: 1.0
+    ignored_action_indices: []
+    ignored_state_indices: []
+    exclusion_reason: local converter exposes anonymous motor columns and gripper polarity cannot be tied to the flattened payload
+    evidence: [local LeRobot metadata audit]
+    groups: []
+
+  - name: oxe_berkeley_autolab_ur5
+    source_id: 4
+    family: oxe
+    embodiment: oxe_berkeley_autolab_ur5_controller
+    embodiment_id: 205
+    source_hz: 5
+    raw_action_dim: 7
+    raw_state_dim: 8
+    status: excluded
+    programs: []
+    quality_weight: 1.0
+    ignored_action_indices: []
+    ignored_state_indices: []
+    exclusion_reason: local converter exposes anonymous motor columns and does not identify quaternion-to-controller conversion in the stored payload
+    evidence: [local LeRobot metadata audit]
+    groups: []
+
+  - name: oxe_austin_sailor
+    source_id: 5
+    family: oxe
+    embodiment: oxe_austin_sailor_controller
+    embodiment_id: 206
+    source_hz: 20
+    raw_action_dim: 7
+    raw_state_dim: 8
+    status: excluded
+    programs: []
+    quality_weight: 1.0
+    ignored_action_indices: []
+    ignored_state_indices: []
+    exclusion_reason: local converter exposes anonymous motor columns and stored gripper polarity is not provenance-bound
+    evidence: [local LeRobot metadata audit]
+    groups: []
+
+  - name: oxe_austin_sirius
+    source_id: 6
+    family: oxe
+    embodiment: oxe_austin_sirius_controller
+    embodiment_id: 207
+    source_hz: 20
+    raw_action_dim: 7
+    raw_state_dim: 8
+    status: excluded
+    programs: []
+    quality_weight: 1.0
+    ignored_action_indices: []
+    ignored_state_indices: []
+    exclusion_reason: local converter exposes anonymous motor columns and stored gripper polarity is not provenance-bound
+    evidence: [local LeRobot metadata audit]
+    groups: []
+
+  - name: oxe_berkeley_fanuc
+    source_id: 7
+    family: oxe
+    embodiment: oxe_berkeley_fanuc_controller
+    embodiment_id: 208
+    source_hz: 10
+    raw_action_dim: 7
+    raw_state_dim: 8
+    status: excluded
+    programs: []
+    quality_weight: 1.0
+    ignored_action_indices: []
+    ignored_state_indices: []
+    exclusion_reason: local converter exposes anonymous motor columns and the synthesized gripper channel is not documented in the local artifact
+    evidence: [local LeRobot metadata audit]
+    groups: []
+
+  - name: oxe_jaco_play
+    source_id: 8
+    family: oxe
+    embodiment: oxe_jaco_play_controller
+    embodiment_id: 209
+    source_hz: 10
+    raw_action_dim: 7
+    raw_state_dim: 8
+    status: excluded
+    programs: []
+    quality_weight: 1.0
+    ignored_action_indices: []
+    ignored_state_indices: []
+    exclusion_reason: local converter exposes anonymous motor columns and its zeroed rotation convention is not declared by the local artifact
+    evidence: [local LeRobot metadata audit]
+    groups: []
+
+  - name: oxe_fmb
+    source_id: 9
+    family: oxe
+    embodiment: oxe_fmb_controller
+    embodiment_id: 210
+    source_hz: 10
+    raw_action_dim: 7
+    raw_state_dim: 8
+    status: excluded
+    programs: []
+    quality_weight: 1.0
+    ignored_action_indices: []
+    ignored_state_indices: []
+    exclusion_reason: local converter exposes anonymous motor columns without a payload-level unit and gripper-polarity contract
+    evidence: [local LeRobot metadata audit]
+    groups: []
+
+  - name: oxe_berkeley_cable
+    source_id: 10
+    family: oxe
+    embodiment: oxe_berkeley_cable_controller
+    embodiment_id: 213
+    source_hz: 10
+    raw_action_dim: 7
+    raw_state_dim: 8
+    status: excluded
+    programs: []
+    quality_weight: 1.0
+    ignored_action_indices: []
+    ignored_state_indices: []
+    exclusion_reason: local converter exposes anonymous motor columns and the constant gripper channel is not identified in local metadata
+    evidence: [local LeRobot metadata audit]
+    groups: []
+
+  - name: oxe_roboturk
+    source_id: 11
+    family: oxe
+    embodiment: oxe_roboturk_controller
+    embodiment_id: 214
+    source_hz: 10
+    raw_action_dim: 7
+    raw_state_dim: 8
+    status: excluded
+    programs: []
+    quality_weight: 1.0
+    ignored_action_indices: []
+    ignored_state_indices: []
+    exclusion_reason: upstream has no standardized proprio contract and local anonymous state columns cannot be assigned physical semantics
+    evidence: [local LeRobot metadata audit]
+    groups: []
+
+  - name: oxe_dlr_edan
+    source_id: 12
+    family: oxe
+    embodiment: oxe_dlr_edan_controller
+    embodiment_id: 215
+    source_hz: 5
+    raw_action_dim: 7
+    raw_state_dim: 7
+    status: excluded
+    programs: []
+    quality_weight: 1.0
+    ignored_action_indices: []
+    ignored_state_indices: []
+    exclusion_reason: local converter exposes anonymous motor columns without a payload-level frame and gripper-polarity contract
+    evidence: [local LeRobot metadata audit]
+    groups: []
+
+  - name: oxe_austin_buds
+    source_id: 13
+    family: oxe
+    embodiment: oxe_austin_buds_controller
+    embodiment_id: 216
+    source_hz: 5
+    raw_action_dim: 7
+    raw_state_dim: 24
+    status: excluded
+    programs: []
+    quality_weight: 1.0
+    ignored_action_indices: []
+    ignored_state_indices: []
+    exclusion_reason: the 24-dimensional local state proves this artifact is not the eight-dimensional standardized OpenVLA representation
+    evidence: [local LeRobot metadata and dimension audit]
+    groups: []
+
+  - name: oxe_nyu_franka
+    source_id: 14
+    family: oxe
+    embodiment: oxe_nyu_franka_controller
+    embodiment_id: 217
+    source_hz: 5
+    raw_action_dim: 15
+    raw_state_dim: 13
+    status: excluded
+    programs: []
+    quality_weight: 1.0
+    ignored_action_indices: []
+    ignored_state_indices: []
+    exclusion_reason: the 15-dimensional local action is not the seven-dimensional standardized action and anonymous columns lack a controller contract
+    evidence: [local LeRobot metadata and dimension audit]
+    groups: []
+
+  - name: oxe_cmu_stretch
+    source_id: 15
+    family: oxe
+    embodiment: oxe_cmu_stretch_controller
+    embodiment_id: 219
+    source_hz: 5
+    raw_action_dim: 8
+    raw_state_dim: 4
+    status: excluded
+    programs: []
+    quality_weight: 1.0
+    ignored_action_indices: []
+    ignored_state_indices: []
+    exclusion_reason: mobile-manipulator action/state columns are anonymous and the local eight-dimensional action disagrees with the documented standardized slice
+    evidence: [local LeRobot metadata and dimension audit]
+    groups: []
+
+  - name: oxe_furniture_bench
+    source_id: 16
+    family: oxe
+    embodiment: oxe_furniture_bench_controller
+    embodiment_id: 220
+    source_hz: 10
+    raw_action_dim: 7
+    raw_state_dim: 8
+    status: verified
+    programs: [geometry_pretrain, action_only, forward_world, joint_world_action]
+    quality_weight: 1.0
+    ignored_action_indices: []
+    ignored_state_indices: []
+    exclusion_reason: ""
+    evidence:
+      - local LeRobot metadata names metric XYZ, roll-pitch-yaw action, quaternion state, and gripper
+      - official OXE transform specifies absolute open-gripper action
+      - local payload range audit matches the declared binary open-gripper action
+    groups:
+      - name: eef
+        group_id: 31
+        action_indices: [0, 1, 2, 3, 4, 5]
+        state_indices: [0, 1, 2, 3, 4, 5, 6]
+        action_semantics: [delta_position_m, delta_position_m, delta_position_m, delta_rotation_euler_xyz_rad, delta_rotation_euler_xyz_rad, delta_rotation_euler_xyz_rad]
+        state_semantics: [eef_position_m, eef_position_m, eef_position_m, eef_quaternion_xyzw, eef_quaternion_xyzw, eef_quaternion_xyzw, eef_quaternion_xyzw]
+        action_frame: robot_base
+        state_frame: robot_base
+        composition_operators: [sum, sum, sum, so3_euler_xyz_base_left, so3_euler_xyz_base_left, so3_euler_xyz_base_left]
+        normalize_state: [true, true, true, false, false, false, false]
+      - name: gripper
+        group_id: 32
+        action_indices: [6]
+        state_indices: [7]
+        action_semantics: [absolute_gripper_open01]
+        state_semantics: [gripper_joint_position_m]
+        action_frame: gripper_scalar
+        state_frame: gripper_joint_coordinate
+        composition_operators: [logical_last]
+        normalize_action: [false]
+
+  - name: oxe_bc_z
+    source_id: 17
+    family: oxe
+    embodiment: oxe_bc_z_controller
+    embodiment_id: 221
+    source_hz: 10
+    raw_action_dim: 7
+    raw_state_dim: 8
+    status: verified
+    programs: [geometry_pretrain, action_only, forward_world, joint_world_action]
+    quality_weight: 0.95
+    ignored_action_indices: []
+    ignored_state_indices: [6]
+    exclusion_reason: ""
+    evidence:
+      - local LeRobot metadata names XYZ, orientation, and gripper channels
+      - official BC-Z transform constructs future Cartesian residual and axis-angle residual
+      - local payload range audit establishes binary open-gripper polarity
+    groups:
+      - name: eef
+        group_id: 31
+        action_indices: [0, 1, 2, 3, 4, 5]
+        state_indices: [0, 1, 2, 3, 4, 5]
+        action_semantics: [delta_position_m, delta_position_m, delta_position_m, delta_rotation_axis_angle_rad, delta_rotation_axis_angle_rad, delta_rotation_axis_angle_rad]
+        state_semantics: [eef_position_m, eef_position_m, eef_position_m, eef_rotation_euler_xyz_rad, eef_rotation_euler_xyz_rad, eef_rotation_euler_xyz_rad]
+        action_frame: robot_base
+        state_frame: robot_base
+        composition_operators: [sum, sum, sum, so3_axis_angle_base_left, so3_axis_angle_base_left, so3_axis_angle_base_left]
+      - name: gripper
+        group_id: 32
+        action_indices: [6]
+        state_indices: [7]
+        action_semantics: [absolute_gripper_open01]
+        state_semantics: [gripper_open01]
+        action_frame: gripper_scalar
+        state_frame: gripper_scalar
+        composition_operators: [logical_last]
+        normalize_action: [false]
+        normalize_state: [false]
+
+  - name: robocasa_atomic
+    source_id: 18
+    family: robocasa
+    embodiment: robocasa_atomic_controller
+    embodiment_id: 223
+    source_hz: 20
+    raw_action_dim: 12
+    raw_state_dim: 16
+    status: verified
+    programs: [geometry_pretrain, action_only, forward_world, joint_world_action]
+    quality_weight: 1.0
+    ignored_action_indices: []
+    ignored_state_indices: []
+    exclusion_reason: ""
+    evidence: &robocasa_evidence
+      - local RoboCasa365 card declares the exact flattened action and state ordering
+      - local HybridMobileBase controller source declares arm/base mode polarity and normalized command space
+      - local payload range audit confirms signed gripper drive and controller-mode values
+    groups: &robocasa_groups
+      - name: mobile_base
+        group_id: 34
+        action_indices: [0, 1, 2]
+        state_indices: [0, 1, 2, 3, 4, 5, 6]
+        action_semantics: [normalized_base_velocity_command, normalized_base_velocity_command, normalized_base_velocity_command]
+        state_semantics: [base_position_m, base_position_m, base_position_m, base_quaternion_xyzw, base_quaternion_xyzw, base_quaternion_xyzw, base_quaternion_xyzw]
+        action_frame: current_mobile_base
+        state_frame: world
+        composition_operators: [last, last, last]
+        normalize_state: [true, true, true, false, false, false, false]
+      - name: torso
+        group_id: 35
+        action_indices: [3]
+        state_indices: []
+        action_semantics: [normalized_joint_delta_command]
+        state_semantics: []
+        action_frame: torso_joint_coordinate
+        state_frame: none
+        composition_operators: [last]
+      - name: control_mode
+        group_id: 36
+        action_indices: [4]
+        state_indices: []
+        action_semantics: [controller_mode]
+        state_semantics: []
+        action_frame: hybrid_controller_scalar
+        state_frame: none
+        composition_operators: [logical_last]
+        normalize_action: [false]
+      - name: eef
+        group_id: 31
+        action_indices: [5, 6, 7, 8, 9, 10]
+        state_indices: [7, 8, 9, 10, 11, 12, 13]
+        action_semantics: [normalized_delta_position_command, normalized_delta_position_command, normalized_delta_position_command, normalized_delta_rotation_axis_angle_command, normalized_delta_rotation_axis_angle_command, normalized_delta_rotation_axis_angle_command]
+        state_semantics: [eef_position_m, eef_position_m, eef_position_m, eef_quaternion_xyzw, eef_quaternion_xyzw, eef_quaternion_xyzw, eef_quaternion_xyzw]
+        action_frame: robot_base
+        state_frame: robot_base
+        composition_operators: [last, last, last, last, last, last]
+        normalize_state: [true, true, true, false, false, false, false]
+      - name: gripper
+        group_id: 32
+        action_indices: [11]
+        state_indices: [14, 15]
+        action_semantics: [absolute_gripper_close01]
+        state_semantics: [gripper_joint_position_m, gripper_joint_position_m]
+        action_frame: gripper_scalar
+        state_frame: gripper_joint_coordinates
+        composition_operators: [logical_last]
+        action_scale: [0.5]
+        action_offset: [0.5]
+        normalize_action: [false]
+
+  - name: robocasa_composite
+    source_id: 19
+    family: robocasa
+    embodiment: robocasa_composite_controller
+    embodiment_id: 224
+    source_hz: 20
+    raw_action_dim: 12
+    raw_state_dim: 16
+    status: verified
+    programs: [geometry_pretrain, action_only, forward_world, joint_world_action]
+    quality_weight: 1.0
+    ignored_action_indices: []
+    ignored_state_indices: []
+    exclusion_reason: ""
+    evidence: *robocasa_evidence
+    groups: *robocasa_groups
+
+  - name: robocasa_mg
+    source_id: 20
+    family: robocasa
+    embodiment: robocasa_mg_controller
+    embodiment_id: 225
+    source_hz: 20
+    raw_action_dim: 12
+    raw_state_dim: 16
+    status: verified
+    programs: [geometry_pretrain, action_only, forward_world, joint_world_action]
+    quality_weight: 1.0
+    ignored_action_indices: []
+    ignored_state_indices: []
+    exclusion_reason: ""
+    evidence: *robocasa_evidence
+    groups: *robocasa_groups

@@ -18,9 +18,11 @@ action:
     10: 16
     15: 24
     20: 32
-  max_events: 32
+  padded_capacity_rule: ceil_duration_times_source_hz_plus_one
+  max_events: 33
+  max_history_events: 65
   max_groups: 8
-  max_substeps_per_renderer_interval: 4
+  max_substeps_per_renderer_interval: 5
   max_action_dim: 16
   max_state_dim: 32
   interpolation: forbidden

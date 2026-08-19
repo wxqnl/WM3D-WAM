@@ -1,13 +1,16 @@
 runtime:
-  visible_cuda_devices: [1, 2, 3, 4, 5, 6, 7]
+  permitted_cuda_devices: [1, 2, 3, 4, 5, 6, 7]
+  visible_cuda_devices: [1, 2, 5, 6, 7]
   forbidden_cuda_devices: [0]
-  nproc_per_node: 7
+  nproc_per_node: 5
   precision: bf16
   fsdp: full_shard
   activation_checkpointing: true
+  nccl_nvls_enable: 0
   micro_batch_per_gpu: 1
   gradient_accumulation_steps: 4
-  effective_global_batch: 28
+  effective_global_batch: 20
+  exact_local_resume_requires_same_ordered_device_mesh: true
 
 optimizer:
   name: adamw
@@ -15,6 +18,13 @@ optimizer:
   max_grad_norm: 1.0
   warmup_steps: 500
   schedule: cosine
+
+checkpoint:
+  geometry_storage: canonical_dcp
+  full_phase_storage: rank_local_fsdp
+  interval_steps: 5000
+  keep_last_completed: 2
+  estimated_full_checkpoint_gib: 91
 
 stages:
   geometry_gam:
@@ -24,6 +34,7 @@ stages:
   wan_action:
     steps: 40000
     warmup_steps: 2000
+    main_steps: 38000
     program_mix: {action_only: 0.5, forward_world: 0.3, joint_world_action: 0.2}
     parameter_stages:
       warmup: wan_action_warmup

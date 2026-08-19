@@ -25,6 +25,24 @@ from .online_episode import (
     first_eligible_episode,
     load_online_robot_window,
 )
+from .hierarchical_sampler import (
+    RecoverableHierarchicalSampler,
+    WindowRequest,
+    source_sampling_weights,
+)
+from .online_dataset import (
+    OnlineRobotDataset,
+    OnlineTrainingSample,
+    build_online_dataloader,
+)
+from .source_contracts import (
+    NormalizationRegistry,
+    SourceContract,
+    SourceContractError,
+    SourceContractRegistry,
+    denormalize_action_values,
+    pack_robot_arrays,
+)
 
 __all__ = [
     "GROUPED_ROBOT_SCHEMA",
@@ -37,12 +55,24 @@ __all__ = [
     "GroupedStateHistoryBatch",
     "OnlineEpisodeError",
     "OnlineRobotWindow",
+    "OnlineRobotDataset",
+    "OnlineTrainingSample",
+    "NormalizationRegistry",
+    "RecoverableHierarchicalSampler",
+    "SourceContract",
+    "SourceContractError",
+    "SourceContractRegistry",
+    "WindowRequest",
     "assign_action_events_to_steps",
     "collate_grouped_action_events",
     "extract_grouped_action_events",
     "first_eligible_episode",
     "load_online_robot_window",
+    "build_online_dataloader",
+    "denormalize_action_values",
     "is_v1_eligible_manifest_record",
     "materialize_source_split",
     "requested_holdout_count",
+    "pack_robot_arrays",
+    "source_sampling_weights",
 ]

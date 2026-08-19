@@ -830,10 +830,8 @@ class VGGTEncoder(nn.Module):
                 f"got N={token_count}, D={channels}; expected "
                 f"N={expected_tokens}, D={self.embed_dim}."
             )
-        if views != self.views_per_timestep:
-            raise ValueError(
-                f"Expected {self.views_per_timestep} views, got {views}."
-            )
+        if views <= 0:
+            raise ValueError("VGGT deep propagation requires at least one real view.")
         scene_batch = batch_size * steps
         current = visual_tokens.reshape(
             scene_batch, views, token_count, channels

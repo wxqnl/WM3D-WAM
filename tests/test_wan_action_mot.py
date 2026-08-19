@@ -48,6 +48,26 @@ def _model(*, with_geometry: bool = False) -> WanActionMoT:
     )
 
 
+def test_experts_each_have_one_registered_module_path() -> None:
+    model = _model()
+
+    video_paths = [
+        name
+        for name, module in model.named_modules(remove_duplicate=False)
+        if module is model.video_expert
+    ]
+    action_paths = [
+        name
+        for name, module in model.named_modules(remove_duplicate=False)
+        if module is model.action_expert
+    ]
+
+    assert video_paths == ["mot.mixtures.video"]
+    assert action_paths == ["mot.mixtures.action"]
+    assert not any(name.startswith("video_expert.") for name in model.state_dict())
+    assert not any(name.startswith("action_expert.") for name in model.state_dict())
+
+
 def test_action_only_runs_through_wan_mot_and_omits_video_decoder() -> None:
     torch.manual_seed(11)
     model = _model().eval()

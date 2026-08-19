@@ -1,9 +1,9 @@
-# WM3D-WAM v1 设计方案（Revision 2）
+# WM3D-WAM v1 设计方案（Revision 3）
 
 | 项目 | 内容 |
 |---|---|
-| 状态 | Revision 2，M2/M3 生产宽度 preflight 完成，正式训练门禁中 |
-| 日期 | 2026-08-19 |
+| 状态 | Revision 3，七源 Stage A/B/C 五卡实现与 canary 完成 |
+| 日期 | 2026-08-20 |
 | 目标仓库 | wxqnl/WM3D-WAM |
 | 当前分支 | codex/implement-wm3d-wam-v1 |
 | 核心模型 | 在线 VGGT 几何主干 + Wan2.2 视频专家 + Grouped Action Flow Expert |
@@ -33,7 +33,7 @@ Revision 1 有三个需要改正的设计点：
 - 当前 21 个 source、547,382 个上游 train-labeled 可用 episode、11,034,768 个候选窗口的统计可信，可继续作为容量基线。
 - 上游 train 标签不是 WM3D-WAM 的最终 train/val/test。最终划分必须在 episode 或 parent trajectory 层完成，绝不在 window 层划分。
 - 全部 source 的训练视频统一成 5 Hz、9 帧、1.6 秒。按 recorded timestamp 选择最接近目标时刻的真实帧；对均匀 5/10/15/20 Hz 数据分别等价于 stride 1/2/3/4，不插帧。
-- Action 不随视频降采样。1.6 秒内分别保留 8/16/24/32 个原生控制事件及其真实时间戳。
+- Action 不随视频降采样。1.6 秒内名义上分别有 8/16/24/32 个原生控制事件；实现按 recorded timestamp 保留边界事件，并用 `ceil(duration × source_hz) + 1` 分配容量。
 - 训练集物理划分与训练采样比例分开管理。物理划分固定；OXE 与 RoboCasa 的采样权重按 objective 改变。
 
 ### 1.2 Action
@@ -59,6 +59,17 @@ Revision 1 有三个需要改正的设计点：
 - 从 node 41 的 gam-vggt-prototype 迁入已经验证过的 VGGT split-and-resume 思路；
 - 从原 WM3D 迁入 grouped robot ABI、数据 adapter、真实时间窗、多视角合同、分布式运行和评测组件；
 - 不迁入旧缓存依赖、实验配置堆积和独立于 Wan 的最终 policy head。
+
+### 1.5 当前实现范围
+
+21 个 source 都已建立显式合同，但当前本地 payload 只为 7 个 source 提供了足够
+的控制语义证据。正式训练接纳 `oxe_bridge`、`oxe_droid`、
+`oxe_furniture_bench`、`oxe_bc_z` 和三个 RoboCasa source，共 527,647 个 train
+episode。其余 14 个 source 保持 excluded，不会被 sampler 静默纳入。
+
+五卡 mesh `1,2,5,6,7` 已完成 Stage A canonical checkpoint/resume、Stage B
+warmup rank-local resume、Stage B main 解冻和 Stage C train/validation/checkpoint。
+这组结果关闭了训练 pipeline 门禁；策略质量仍由正式长训和后续评测决定。
 
 ## 2. 证据与设计依据
 
@@ -460,7 +471,7 @@ future shallow target 在同一次训练 forward 中由冻结 VGGT shallow block
 
 ### 7.3 可选 Wan VAE 优化
 
-默认先跑在线 VAE。只有真实七卡 profile 证明 VAE 占据主要 wall time，才允许实验有界、可删除的 Wan VAE shard cache。它必须满足：
+默认先跑在线 VAE。只有真实多卡 profile 证明 VAE 占据主要 wall time，才允许实验有界、可删除的 Wan VAE shard cache。它必须满足：
 
 - 仅缓存 Wan latent，不缓存 VGGT 派生量；
 - 在线路径始终可独立训练；
@@ -660,11 +671,11 @@ future-aware slow policy：
 必须完成：
 
 1. 物化 episode、parent trajectory 与 task-OOD split 列表。
-2. 完成 21 个 source 的 action semantic、单位、坐标系、组合算子与 gripper 极性合同。
+2. 为 21 个 source 建立显式合同；只有完成 action semantic、单位、坐标系、组合算子与 gripper 极性审计的 source 才标为 verified。
 3. 完成三路 view role 审计。
 4. 建立 5 Hz / 9 帧 window plan 与 PTS invalid reason 报告。
 5. 把 VGGT-1B 与 Wan2.2 TI2V-5B 放入服务器只读模型目录。
-6. 用正式在线路径跑单卡与七卡 memory / throughput profile。
+6. 用正式在线路径跑单卡与多卡 memory / throughput profile。
 
 42 上已经存在 facebook/VGGT-1B 资产，约 4.7 GB。Wan2.2 权重是否齐备必须在实现开始时再次检查；训练脚本不允许运行中临时下载。
 
@@ -735,23 +746,27 @@ FastWAM 的正式训练会更新 MoT 主干。永久冻结 Wan 会限制视频�
 
 视频与 Action 使用各自 scheduler 的 flow matching。binary/gripper 的 -1/+1 flow target 另加 clean-endpoint BCE。没有反事实真值时不添加鼓励任意运动差异的伪 counterfactual loss。
 
-### 10.7 七卡运行
+### 10.7 分布式运行
 
-    CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7
-    nproc_per_node=7
+    CUDA_VISIBLE_DEVICES=1,2,5,6,7
+    nproc_per_node=5
     micro_batch_per_gpu=1
     gradient_accumulation_steps=4
-    effective_global_batch=28
+    effective_global_batch=20
     precision=bf16
     fsdp=full_shard
     activation_checkpointing=true
+    NCCL_NVLS_ENABLE=0
 
-GPU 0 在 launcher 与 preflight 中都列为 forbidden device。正式训练使用同一模型路径完成短 canary，不维护简化模型：
+GPU 0 在 launcher 与 preflight 中都列为 forbidden device。runtime 支持显式列出
+物理 GPU 1–7 的任意子集；当前正式配置采用已经通过完整模型 canary 的五卡
+mesh。Stage B/C 的 rank-local checkpoint 要求相同 world size 和相同有序物理
+GPU mesh。已经完成的门禁为：
 
-1. 单卡 20 steps，检查 shape、mask 与 gradient ownership；
-2. 七卡 200 steps，记录 decode、VGGT、VAE、DiT、通信占比；
-3. 七卡 300 steps，检查 loss、吞吐、显存和恢复；
-4. 通过后进入正式 steps。
+1. 单卡生产宽度 shape、mask、gradient ownership 和三步短拟合；
+2. Stage A 双卡 canonical checkpoint 与精确恢复；
+3. Stage B warmup 五卡三种 route、rank-local checkpoint 与精确恢复；
+4. Stage B main 和 Stage C 五卡 train、validation 与完整 checkpoint。
 
 ## 11. 评测与关键消融
 
@@ -798,7 +813,7 @@ Wan-coupled Action 是主方案，不等待消融才实现。detached head 只�
 
 Stage A → B：
 
-- 所有 source 的 online VGGT forward 与 loss finite；
+- 所有 verified source 的 online VGGT forward 与 loss finite；
 - policy mode 无法读取 future factual action 或 future target token；
 - future feature、depth/camera 中至少一项稳定优于 hold-last；
 - direct 与 refined auxiliary action 均有有效梯度。
@@ -817,7 +832,7 @@ Stage C → v1：
 - per-source macro 与 family weighted 两套结果同时报告；
 - task-OOD 和 high-motion 不出现系统性动作提前、静止或末帧复制；
 - 4 段 rollout 没有持续 geometry collapse；
-- 七卡编号 checkpoint 能恢复 model、optimizer、scheduler、sampler cursor 与 RNG。
+- 编号 checkpoint 能恢复 model、optimizer、scheduler、sampler cursor、RNG 与有序 GPU mesh。
 
 ## 12. 仓库结构
 
@@ -929,7 +944,7 @@ Grouped Robot ABI、连续时间和 geometry adapter 是本项目新增，不能
 ### M1：数据合同
 
 - 物化 episode/parent/task split；
-- 完成 21 个 source 的 action 与 view audit；
+- 为 21 个 source 建立显式 gate；只有审计完成的 source 标为 verified；
 - 生成 5 Hz window plan 和 invalid reason 报告；
 - 以少量真实 window 跑在线 decode，不生成派生 cache。
 
@@ -937,7 +952,7 @@ Grouped Robot ABI、连续时间和 geometry adapter 是本项目新增，不能
 
 - 迁入 split-and-resume；
 - 实现 policy/factual 两种 geometry mode；
-- 完成 Stage A canary 与正式训练；
+- 完成 Stage A canary，再启动正式训练；
 - 验证 geometry-refined auxiliary action。
 
 ### M3：Wan-Action MoT
@@ -954,10 +969,11 @@ Grouped Robot ABI、连续时间和 geometry adapter 是本项目新增，不能
 - 完成 Action coupling、5/10 Hz、future-aware 等关键消融；
 - 冻结 v1 inference program。
 
-当前实现状态：M1 的 episode split、timestamp window 和在线 decode 已完成，
-但 21 个 source 的控制语义审计尚未完成；M2/M3 的单卡生产宽度计算图、三种
-interaction program、Stage A 与 Stage B preflight 已完成。正式长训、七卡
-FSDP canary、checkpoint resume 和评测仍属于后续门禁。具体证据见
+当前实现状态：M1 的 episode split、timestamp window、稀疏在线 decode 和
+21-source gate 已完成，其中 7 个 source verified、14 个 excluded。M2/M3 的
+生产宽度计算图和三种 interaction program 已完成。M4 的五卡 Stage A/B/C
+FSDP、checkpoint、resume 与 validation canary 已完成。下一步是七源正式长训、
+统一评测，以及为 excluded source 补齐 payload-level 控制合同。具体证据见
 [EXPERIMENTS.md](EXPERIMENTS.md)。
 
 ## 15. 主要风险
@@ -972,13 +988,13 @@ FSDP canary、checkpoint resume 和评测仍属于后续门禁。具体证据见
 | RoboCasa MG 主导 | 过拟合单一模拟分布 | family/source/episode 分层，RC 内 10/60/30 |
 | 低分辨率大源拖低视频 | 模糊和伪影 | Tier B 半权重，Tier C 不做 Wan loss |
 | VGGT 深层破坏预训练几何 | depth/camera 退化 | shallow 冻结、deep 低学习率、Stage A 门禁 |
-| 七卡显存不足 | OOM 或吞吐极低 | FSDP full shard、checkpointing、micro batch 1、稀疏 geometry adapters |
-| 七卡训练状态恢复未验证 | 长训中断后无法精确续跑 | FSDP canary 同时核对模型、optimizer、scheduler、sampler cursor 与 RNG 恢复 |
+| 多卡显存不足 | OOM 或吞吐极低 | 五卡 FSDP full shard 已验证；保留 checkpointing、micro batch 1 和稀疏 geometry adapters |
+| 训练状态恢复回归 | 长训中断后无法精确续跑 | checkpoint 同时保存并校验模型、optimizer、scheduler、sampler cursor、RNG 与有序 GPU mesh |
 
 ## 16. 默认配置摘要
 
 ~~~yaml
-project: wm3d_wam_v1_r2
+project: wm3d_wam_v1_r3
 
 time:
   context_horizon_s: 3.2
@@ -1007,7 +1023,9 @@ video_action:
   action_expert_blocks: 30
   action_hidden: 1024
   action_ffn: 4096
-  action_max_events: 32
+  action_nominal_events: [8, 16, 24, 32]
+  action_max_events: 33
+  action_max_history_events: 65
   mot_mixed_attention: true
   geometry_adapter_layers: [5, 11, 17, 23, 29]
   freeze_vae: true
@@ -1023,18 +1041,23 @@ sampling:
   oxe_source_cap: 0.20
 
 runtime:
-  visible_gpus: [1, 2, 3, 4, 5, 6, 7]
+  permitted_gpus: [1, 2, 3, 4, 5, 6, 7]
+  visible_gpus: [1, 2, 5, 6, 7]
   forbidden_gpus: [0]
+  nproc_per_node: 5
   precision: bf16
   fsdp: full_shard
   micro_batch_per_gpu: 1
   gradient_accumulation_steps: 4
-  effective_global_batch: 28
+  effective_global_batch: 20
+  nccl_nvls_enable: 0
 
 training:
   stage_a_steps: 30000
   stage_b_steps: 40000
   stage_c_steps: 20000
+  checkpoint_interval_steps: 5000
+  keep_last_completed_checkpoints: 2
   persistent_vggt_cache: false
   persistent_wan_cache: false
 ~~~
@@ -1058,7 +1081,7 @@ training:
 
 ### 18.1 数据划分合理吗
 
-旧方案的数据总量与分层抽样思路合理，但 dual-rate 视频桶和把上游 train 当最终 train 的表述不够严谨。Revision 2 已改为 episode/parent 层的显式 train/val/test、objective-specific family sampling，以及统一 5 Hz / 9 帧视频。Action 仍保留原生频率。这是当前数据与七卡预算下更稳的 v1。
+旧方案的数据总量与分层抽样思路合理，但 dual-rate 视频桶和把上游 train 当最终 train 的表述不够严谨。Revision 3 使用 episode/parent 层的显式 train/val/test、objective-specific family sampling、21-source gate 和统一 5 Hz / 9 帧视频。Action 保留原生频率。当前只训练 7 个 verified source，五卡 profile 已跑通。
 
 ### 18.2 Action 要不要走 Wan2.2
 

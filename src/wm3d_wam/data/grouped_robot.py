@@ -40,6 +40,14 @@ ACTION_SEMANTIC_IDS: Mapping[str, int] = {
     "controller_mode": 13,
     "joint_velocity_rps": 14,
     "joint_torque_nm": 15,
+    # Source-native controller spaces that are explicitly documented as
+    # normalized commands.  These must not be confused with physical metric
+    # deltas: RoboCasa applies the controller output limits downstream.
+    "normalized_base_velocity_command": 16,
+    "normalized_joint_delta_command": 17,
+    "normalized_delta_position_command": 18,
+    "normalized_delta_rotation_axis_angle_command": 19,
+    "delta_rotation_euler_xyz_rad": 20,
 }
 
 STATE_SEMANTIC_IDS: Mapping[str, int] = {
@@ -55,6 +63,11 @@ STATE_SEMANTIC_IDS: Mapping[str, int] = {
     "force_torque": 9,
     "tactile": 10,
     "controller_state": 11,
+    "eef_rotation_euler_xyz_rad": 12,
+    "eef_quaternion_xyzw": 13,
+    "base_position_m": 14,
+    "base_quaternion_xyzw": 15,
+    "gripper_joint_position_m": 16,
 }
 
 COMPOSITION_OPERATOR_IDS: Mapping[str, int] = {
@@ -65,6 +78,7 @@ COMPOSITION_OPERATOR_IDS: Mapping[str, int] = {
     "time_weighted_mean": 4,
     "logical_last": 5,
     "so3_axis_angle_body_right": 6,
+    "so3_euler_xyz_base_left": 7,
 }
 
 

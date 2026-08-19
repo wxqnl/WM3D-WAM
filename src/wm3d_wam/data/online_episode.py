@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -27,7 +28,12 @@ from .grouped_history import (
     GroupedStateHistoryBatch,
     assign_action_events_to_steps,
 )
-from .grouped_robot import ACTION_SEMANTIC_IDS, STATE_SEMANTIC_IDS
+from .source_contracts import (
+    NormalizationRegistry,
+    PackedRobotArrays,
+    SourceContract,
+    pack_robot_arrays,
+)
 from .window_selection import WindowSelectionError, select_observed_world_window
 
 
@@ -38,6 +44,7 @@ class OnlineEpisodeError(RuntimeError):
 @dataclass(frozen=True)
 class OnlineRobotWindow:
     source: str
+    source_id: int
     episode_id: str
     task_text: str
     observed_images: torch.Tensor             # [4,V,3,224,224]
@@ -53,6 +60,12 @@ class OnlineRobotWindow:
     future_video_times_s: torch.Tensor         # [9], relative to anchor
     action_history_times_s: torch.Tensor
     future_action_times_s: torch.Tensor
+    quality_weight: float
+    anchor_time_s: float
+    target_view_index: int
+    valid_view_count: int
+    sample_index: int = -1
+    decode_retry_count: int = 0
 
     @property
     def batch_size(self) -> int:
@@ -60,6 +73,8 @@ class OnlineRobotWindow:
 
     @property
     def view_count(self) -> int:
+        """Exact real camera count for this sample."""
+
         return int(self.observed_images.shape[1])
 
     def to(
@@ -73,6 +88,7 @@ class OnlineRobotWindow:
         float_dtype = dtype or self.observed_images.dtype
         return OnlineRobotWindow(
             source=self.source,
+            source_id=self.source_id,
             episode_id=self.episode_id,
             task_text=self.task_text,
             observed_images=self.observed_images.to(
@@ -106,6 +122,12 @@ class OnlineRobotWindow:
             future_action_times_s=self.future_action_times_s.to(
                 device=device, dtype=float_dtype
             ),
+            quality_weight=self.quality_weight,
+            anchor_time_s=self.anchor_time_s,
+            target_view_index=self.target_view_index,
+            valid_view_count=self.valid_view_count,
+            sample_index=self.sample_index,
+            decode_retry_count=self.decode_retry_count,
         )
 
 
@@ -213,19 +235,57 @@ def _mapped(accessor: ParquetEpisodeAccessor, terms: list[dict[str, Any]]) -> np
     return result
 
 
-def _decode_video_segment(
-    path: Path, *, start_s: float, stop_s: float, expected_rows: int
+def _decode_video_rows(
+    path: Path,
+    *,
+    start_s: float,
+    stop_s: float,
+    observation_times_s: np.ndarray,
+    rows: np.ndarray,
 ) -> np.ndarray:
+    """Seek once and decode only the exact recorded rows needed by a window.
+
+    LeRobot video files concatenate many episodes. Decoding an entire episode
+    segment to retain a two-second training window turns a handful of unlucky
+    samples into minute-scale distributed stragglers. Manifest view offsets and
+    the recorded observation clock define the absolute PTS for each row, so we
+    seek to the keyframe preceding the first requested PTS and stop immediately
+    after the last one.
+    """
+
     import av
 
-    frames: list[np.ndarray] = []
+    observation_times = np.asarray(observation_times_s, dtype=np.float64).reshape(-1)
+    requested_rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+    if observation_times.size < 2 or not np.isfinite(observation_times).all():
+        raise OnlineEpisodeError("video row selection requires a finite recorded clock")
+    if bool((np.diff(observation_times) <= 0.0).any()):
+        raise OnlineEpisodeError("recorded observation clock is not strictly increasing")
+    if requested_rows.size < 1 or bool((requested_rows < 0).any()) or bool(
+        (requested_rows >= observation_times.size).any()
+    ):
+        raise OnlineEpisodeError("requested video row is outside the episode")
+    if not np.isfinite(start_s) or not np.isfinite(stop_s) or stop_s <= start_s:
+        raise OnlineEpisodeError("manifest video segment has an invalid PTS range")
+
+    unique_rows = np.unique(requested_rows)
+    target_times = float(start_s) + (
+        observation_times[unique_rows] - observation_times[0]
+    )
+    nominal_dt = float(np.median(np.diff(observation_times)))
+    tolerance_s = max(1.0e-6, 0.45 * nominal_dt)
+    if target_times[0] < start_s - tolerance_s or target_times[-1] >= stop_s + tolerance_s:
+        raise OnlineEpisodeError("recorded video targets exceed the manifest PTS range")
+
+    wanted = {int(row) for row in unique_rows}
+    decoded: dict[int, np.ndarray] = {}
     with av.open(str(path.resolve(strict=True)), mode="r") as container:
         streams = list(container.streams.video)
         if len(streams) != 1:
             raise OnlineEpisodeError("expected exactly one video stream")
         stream = streams[0]
         container.seek(
-            int(start_s / float(stream.time_base)),
+            int(max(start_s, float(target_times[0])) / float(stream.time_base)),
             stream=stream,
             backward=True,
             any_frame=False,
@@ -234,20 +294,38 @@ def _decode_video_segment(
             if frame.pts is None or frame.time_base is None:
                 raise OnlineEpisodeError("video frame has no recorded PTS")
             pts = float(frame.pts * frame.time_base)
-            if pts + 1.0e-12 < start_s:
+            if pts + tolerance_s < start_s:
                 continue
-            if pts >= stop_s - 1.0e-12:
+            if pts >= stop_s + tolerance_s:
                 break
-            frames.append(frame.to_ndarray(format="rgb24"))
-    if len(frames) == expected_rows + 1:
-        # Encoder flush frames have no corresponding observation row.  They
-        # may be discarded; a missing real row is never repeated.
-        frames = frames[:expected_rows]
-    if len(frames) != expected_rows:
+            recorded_time = observation_times[0] + (pts - float(start_s))
+            insert = int(np.searchsorted(observation_times, recorded_time, side="left"))
+            candidates = [
+                index
+                for index in (insert - 1, insert)
+                if 0 <= index < observation_times.size
+            ]
+            if not candidates:
+                continue
+            row = min(
+                candidates,
+                key=lambda index: abs(float(observation_times[index]) - recorded_time),
+            )
+            error_s = abs(float(observation_times[row]) - recorded_time)
+            if error_s <= tolerance_s and row in wanted and row not in decoded:
+                decoded[row] = frame.to_ndarray(format="rgb24")
+                if len(decoded) == len(wanted):
+                    break
+            if pts > float(target_times[-1]) + tolerance_s:
+                break
+
+    missing = sorted(wanted - set(decoded))
+    if missing:
         raise OnlineEpisodeError(
-            f"video/observation ordinal mismatch: {len(frames)} != {expected_rows}"
+            "video/observation PTS mismatch for requested rows "
+            f"{missing[:8]} in {path}"
         )
-    output = np.stack(frames)
+    output = np.stack([decoded[int(row)] for row in requested_rows])
     if output.dtype != np.uint8 or output.ndim != 4 or output.shape[-1] != 3:
         raise OnlineEpisodeError("decoded video is not uint8 RGB")
     return output
@@ -273,14 +351,12 @@ def _resize_center_crop(frames: np.ndarray, size: int) -> torch.Tensor:
 
 def _action_events(
     *,
-    values: np.ndarray,
+    packed: PackedRobotArrays,
     timestamps_s: np.ndarray,
     start_s: float,
     stop_s: float,
     time_origin_s: float | None = None,
     embodiment_id: int,
-    max_groups: int,
-    max_action_dim: int,
     max_events: int,
     timestamp_tolerance_s: float = 1.0e-6,
 ) -> GroupedActionBatch:
@@ -288,31 +364,13 @@ def _action_events(
     keep = (timestamps_s >= np.float64(start_s) - tolerance) & (
         timestamps_s < np.float64(stop_s) - tolerance
     )
-    selected_values = values[keep]
+    selected_values = packed.action_values[keep]
+    selected_mask = packed.action_value_mask[keep]
     selected_times = timestamps_s[keep]
     if len(selected_values) < 1 or len(selected_values) > max_events:
         raise OnlineEpisodeError(
             f"action event count {len(selected_values)} is outside [1,{max_events}]"
         )
-    action_dim = int(values.shape[1])
-    if action_dim > max_action_dim:
-        raise OnlineEpisodeError("source action dimension exceeds grouped capacity")
-    padded = np.zeros(
-        (len(selected_values), max_groups, max_action_dim), dtype=np.float32
-    )
-    padded[:, 0, :action_dim] = selected_values
-    value_mask = np.zeros_like(padded, dtype=np.bool_)
-    value_mask[:, 0, :action_dim] = True
-    group_ids = np.zeros((max_groups,), dtype=np.int64)
-    group_ids[0] = 30
-    group_mask = np.zeros((max_groups,), dtype=np.bool_)
-    group_mask[0] = True
-    semantics = np.zeros((max_groups, max_action_dim), dtype=np.int64)
-    semantics[0, :action_dim] = ACTION_SEMANTIC_IDS["controller_command"]
-    composition = np.zeros_like(semantics)
-    # Existing audited v4 adapters declare source-native controller channels
-    # with last-value composition until per-source semantics are upgraded.
-    composition[0, :action_dim] = 3
     origin = start_s if time_origin_s is None else float(time_origin_s)
     relative = (selected_times - np.float64(origin)).astype(np.float32)
     event_dt = np.diff(
@@ -321,14 +379,14 @@ def _action_events(
         )
     ).astype(np.float32)
     events = GroupedActionEvents(
-        values=padded,
-        value_mask=value_mask,
+        values=selected_values.copy(),
+        value_mask=selected_mask.copy(),
         times_s=relative,
         event_dt_s=event_dt,
-        group_ids=group_ids,
-        group_mask=group_mask,
-        action_semantic_ids=semantics,
-        composition_operator_ids=composition,
+        group_ids=packed.group_ids.copy(),
+        group_mask=packed.group_mask.copy(),
+        action_semantic_ids=packed.action_semantic_ids.copy(),
+        composition_operator_ids=packed.composition_operator_ids.copy(),
         embodiment_id=np.int64(embodiment_id),
     )
     return collate_grouped_action_events(
@@ -338,31 +396,14 @@ def _action_events(
 
 def _state_history(
     *,
-    values: np.ndarray,
+    packed: PackedRobotArrays,
     timestamps_s: np.ndarray,
     rows: np.ndarray,
     anchor_s: float,
     embodiment_id: int,
-    max_groups: int,
-    max_state_dim: int,
 ) -> GroupedStateHistoryBatch:
-    state_dim = int(values.shape[1])
-    if state_dim > max_state_dim:
-        raise OnlineEpisodeError("source state dimension exceeds grouped capacity")
-    history = np.zeros(
-        (1, len(rows), max_groups, max_state_dim), dtype=np.float32
-    )
-    history[0, :, 0, :state_dim] = values[rows]
-    mask = np.zeros_like(history, dtype=np.bool_)
-    mask[0, :, 0, :state_dim] = True
-    group_ids = np.zeros((1, max_groups), dtype=np.int64)
-    group_ids[0, 0] = 30
-    group_mask = np.zeros((1, max_groups), dtype=np.bool_)
-    group_mask[0, 0] = True
-    semantics = np.zeros(
-        (1, max_groups, max_state_dim), dtype=np.int64
-    )
-    semantics[0, 0, :state_dim] = STATE_SEMANTIC_IDS["controller_state"]
+    history = packed.state_values[rows].copy()[None]
+    mask = packed.state_value_mask[rows].copy()[None]
     return GroupedStateHistoryBatch(
         values=torch.from_numpy(history),
         value_mask=torch.from_numpy(mask),
@@ -370,11 +411,66 @@ def _state_history(
         times_s=torch.from_numpy(
             (timestamps_s[rows] - np.float64(anchor_s)).astype(np.float32)
         ).unsqueeze(0),
-        group_ids=torch.from_numpy(group_ids),
-        group_mask=torch.from_numpy(group_mask),
-        state_semantic_ids=torch.from_numpy(semantics),
+        group_ids=torch.from_numpy(packed.group_ids.copy()).unsqueeze(0),
+        group_mask=torch.from_numpy(packed.group_mask.copy()).unsqueeze(0),
+        state_semantic_ids=torch.from_numpy(
+            packed.state_semantic_ids.copy()
+        ).unsqueeze(0),
         embodiment_ids=torch.tensor([embodiment_id], dtype=torch.long),
     )
+
+
+def _select_recorded_window(
+    observation_times: np.ndarray,
+    *,
+    anchor_fraction: float,
+):
+    if not np.isfinite(anchor_fraction) or not 0.0 <= anchor_fraction < 1.0:
+        raise OnlineEpisodeError("anchor_fraction must be finite in [0,1)")
+    row_count = int(observation_times.shape[0])
+    desired = min(row_count - 1, int(np.floor(anchor_fraction * row_count)))
+    for offset in range(row_count):
+        anchor_row = (desired + offset) % row_count
+        if anchor_row < 1:
+            continue
+        if observation_times[anchor_row] - observation_times[0] < 2.88:
+            continue
+        try:
+            selected = select_observed_world_window(
+                observation_times,
+                anchor_index=anchor_row,
+                context_samples=16,
+                future_samples=8,
+                context_horizon_s=3.2,
+                future_horizon_s=1.6,
+                minimum_horizon_coverage=0.9,
+                future_offsets_s=np.arange(1, 9, dtype=np.float64) * 0.2,
+            )
+        except WindowSelectionError:
+            continue
+        boundary_span = (
+            observation_times[anchor_row]
+            - observation_times[selected.leading_boundary_index]
+        )
+        if boundary_span >= 3.2 - 1.0e-3:
+            return selected
+    raise OnlineEpisodeError(
+        "episode has no real-timestamp window meeting 90% horizon coverage"
+    )
+
+
+def _choose_target_view(view_count: int, fraction: float) -> int:
+    if view_count <= 0:
+        raise OnlineEpisodeError("cannot choose a target from zero views")
+    if not np.isfinite(fraction) or not 0.0 <= fraction < 1.0:
+        raise OnlineEpisodeError("target_view_fraction must be finite in [0,1)")
+    # Manifest view order is external-primary, external-secondary, wrist for
+    # the audited adapters.  Renormalize the v1 50/25/25 target mixture when a
+    # source exposes fewer real views.
+    weights = np.asarray((0.50, 0.25, 0.25), dtype=np.float64)[:view_count]
+    weights /= weights.sum()
+    cumulative = np.cumsum(weights)
+    return min(view_count - 1, int(np.searchsorted(cumulative, fraction, side="right")))
 
 
 def load_online_robot_window(
@@ -382,8 +478,12 @@ def load_online_robot_window(
     source_root: Path,
     adapter_path: Path,
     episode: dict[str, Any],
-    embodiment_id: int,
-    source_hz: int,
+    source_contract: SourceContract,
+    normalization: NormalizationRegistry,
+    anchor_fraction: float = 0.0,
+    target_view_fraction: float = 0.0,
+    sample_index: int = -1,
+    decode_retry_count: int = 0,
     max_views: int = 3,
     max_groups: int = 8,
     max_action_dim: int = 16,
@@ -391,13 +491,19 @@ def load_online_robot_window(
     vggt_size: int = 224,
     wan_size: int = 256,
 ) -> OnlineRobotWindow:
-    """Load the first valid 3.2 s history + 1.6 s future window online."""
+    """Load one deterministic real 3.2 s history + 1.6 s future window."""
 
     source_root = Path(source_root).resolve(strict=True)
     adapter = _load_adapter(adapter_path)
-    stride = int(source_hz) // 5
-    if int(source_hz) not in {5, 10, 15, 20} or stride * 5 != int(source_hz):
-        raise OnlineEpisodeError("source_hz must be one of 5/10/15/20")
+    if not source_contract.trainable:
+        raise OnlineEpisodeError(
+            f"source contract {source_contract.name!r} is not approved for training"
+        )
+    if str(episode.get("source", "")) != source_contract.name:
+        raise OnlineEpisodeError("episode source and semantic contract do not match")
+    source_hz = source_contract.source_hz
+    if int(source_hz) % 5:
+        raise OnlineEpisodeError("source contract frequency is not renderer-compatible")
     row_count = int(episode["observation_samples"])
     payload = source_root / str(episode["payload"])
     accessor = ParquetEpisodeAccessor(
@@ -417,6 +523,15 @@ def load_online_robot_window(
     group = adapter["groups"][0]
     actions = _mapped(accessor, group["action"])
     states = _mapped(accessor, group["state"])
+    packed = pack_robot_arrays(
+        actions,
+        states,
+        contract=source_contract,
+        normalization=normalization,
+        max_groups=max_groups,
+        max_action_dim=max_action_dim,
+        max_state_dim=max_state_dim,
+    )
     action_times = np.asarray(
         accessor.array(str(group["action_time_key"])), dtype=np.float64
     ).reshape(-1)
@@ -426,36 +541,9 @@ def load_online_robot_window(
     if action_times.shape != (row_count,) or state_times.shape != (row_count,):
         raise OnlineEpisodeError("robot clocks do not align with episode rows")
 
-    selected_window = None
-    # Use recorded timestamps, not a fixed ordinal stride.  This retains the
-    # audited 90%-coverage episodes while still selecting only real rows.
-    for anchor_row in range(1, row_count):
-        if observation_times[anchor_row] - observation_times[0] < 2.88:
-            continue
-        try:
-            selected_window = select_observed_world_window(
-                observation_times,
-                anchor_index=anchor_row,
-                context_samples=16,
-                future_samples=8,
-                context_horizon_s=3.2,
-                future_horizon_s=1.6,
-                minimum_horizon_coverage=0.9,
-                future_offsets_s=np.arange(1, 9, dtype=np.float64) * 0.2,
-            )
-        except WindowSelectionError:
-            continue
-        boundary_span = (
-            observation_times[anchor_row]
-            - observation_times[selected_window.leading_boundary_index]
-        )
-        if boundary_span < 3.2 - 1.0e-3:
-            continue
-        break
-    if selected_window is None:
-        raise OnlineEpisodeError(
-            "episode has no real-timestamp window meeting 90% horizon coverage"
-        )
+    selected_window = _select_recorded_window(
+        observation_times, anchor_fraction=anchor_fraction
+    )
     state_rows = selected_window.context_indices
     future_rows = selected_window.future_indices
     anchor_row = int(state_rows[-1])
@@ -470,6 +558,17 @@ def load_online_robot_window(
         [np.asarray([anchor_row], dtype=np.int64), future_rows]
     )
     future_anchor_rows = future_rows[np.asarray([1, 3, 5, 7])]
+    geometry_rows = np.concatenate([keyframe_rows, future_anchor_rows])
+    decoded_rows = np.unique(np.concatenate([geometry_rows, future_video_rows]))
+    decoded_row_positions = {
+        int(row): index for index, row in enumerate(decoded_rows.tolist())
+    }
+    geometry_positions = np.asarray(
+        [decoded_row_positions[int(row)] for row in geometry_rows], dtype=np.int64
+    )
+    wan_positions = np.asarray(
+        [decoded_row_positions[int(row)] for row in future_video_rows], dtype=np.int64
+    )
 
     asset_by_role = {
         str(item["role"]): source_root / str(item["path"])
@@ -480,15 +579,19 @@ def load_online_robot_window(
         raise OnlineEpisodeError("episode has no manifest-bound RGB views")
     selected_by_view: list[torch.Tensor] = []
     selected_wan: torch.Tensor | None = None
+    target_view_index = _choose_target_view(
+        len(view_specs), target_view_fraction
+    )
     for view_index, view in enumerate(view_specs):
         role = str(view["asset_role"])
         if role not in asset_by_role:
             raise OnlineEpisodeError(f"view asset role {role!r} is missing")
-        frames = _decode_video_segment(
+        frames = _decode_video_rows(
             asset_by_role[role],
             start_s=float(view["start_s"]),
             stop_s=float(view["stop_s"]),
-            expected_rows=row_count,
+            observation_times_s=observation_times,
+            rows=decoded_rows,
         )
         adapter_view = next(
             (item for item in adapter["views"] if item["name"] == view["name"]),
@@ -496,34 +599,52 @@ def load_online_robot_window(
         )
         if adapter_view is not None and adapter_view.get("color_order", "rgb") == "bgr":
             frames = frames[..., ::-1].copy()
-        selected_rows = np.concatenate([keyframe_rows, future_anchor_rows])
-        selected_by_view.append(_resize_center_crop(frames[selected_rows], vggt_size))
-        if view_index == 0:
-            selected_wan = _resize_center_crop(frames[future_video_rows], wan_size)
+        selected_by_view.append(
+            _resize_center_crop(frames[geometry_positions], vggt_size)
+        )
+        if view_index == target_view_index:
+            selected_wan = _resize_center_crop(frames[wan_positions], wan_size)
+    valid_view_count = len(selected_by_view)
+    # Micro-batch size is one, so retain the exact real camera bucket instead
+    # of inserting synthetic images.  VGGT weights are view-count agnostic and
+    # the encoder executes the sample's dynamic V=1/2/3 layout.
     stacked = torch.stack(selected_by_view, dim=1)  # [8,V,3,H,W]
     if selected_wan is None:
         raise RuntimeError("primary Wan view was not decoded")
 
     history_actions = _action_events(
-        values=actions,
+        packed=packed,
         timestamps_s=action_times,
         start_s=history_start_s,
         stop_s=history_stop_s,
         time_origin_s=anchor_s,
-        embodiment_id=embodiment_id,
-        max_groups=max_groups,
-        max_action_dim=max_action_dim,
-        max_events=64,
+        embodiment_id=source_contract.embodiment_id,
+        max_events=max(
+            1,
+            int(
+                math.ceil(
+                    (history_stop_s - history_start_s)
+                    * float(source_contract.source_hz)
+                )
+            )
+            + 1,
+        ),
     )
     future_actions = _action_events(
-        values=actions,
+        packed=packed,
         timestamps_s=action_times,
         start_s=anchor_s,
         stop_s=future_stop_s,
-        embodiment_id=embodiment_id,
-        max_groups=max_groups,
-        max_action_dim=max_action_dim,
-        max_events=32,
+        embodiment_id=source_contract.embodiment_id,
+        max_events=max(
+            1,
+            int(
+                math.ceil(
+                    (future_stop_s - anchor_s) * float(source_contract.source_hz)
+                )
+            )
+            + 1,
+        ),
     )
     history_boundary_rows = np.concatenate(
         [
@@ -546,24 +667,24 @@ def load_online_robot_window(
         future_actions, step_boundaries_s=future_boundaries
     )
     state_history = _state_history(
-        values=states,
+        packed=packed,
         timestamps_s=state_times,
         rows=state_rows,
         anchor_s=anchor_s,
-        embodiment_id=embodiment_id,
-        max_groups=max_groups,
-        max_state_dim=max_state_dim,
+        embodiment_id=source_contract.embodiment_id,
     )
-    view_count = len(view_specs)
+    observed_view_mask = torch.ones((4, valid_view_count), dtype=torch.bool)
+    future_view_mask = torch.ones((4, valid_view_count), dtype=torch.bool)
     return OnlineRobotWindow(
         source=str(episode["source"]),
+        source_id=source_contract.source_id,
         episode_id=str(episode["episode_id"]),
         task_text=str(episode.get("task_text", "")),
         observed_images=stacked[:4],
         future_anchor_images=stacked[4:],
         wan_video=selected_wan.permute(1, 0, 2, 3).contiguous(),
-        observed_view_valid_mask=torch.ones((4, view_count), dtype=torch.bool),
-        future_view_valid_mask=torch.ones((4, view_count), dtype=torch.bool),
+        observed_view_valid_mask=observed_view_mask,
+        future_view_valid_mask=future_view_mask,
         state_history=state_history,
         action_history=history_timeline,
         future_action_history=future_timeline,
@@ -574,4 +695,10 @@ def load_online_robot_window(
         ),
         action_history_times_s=history_actions.times_s[0, history_actions.event_mask[0]],
         future_action_times_s=future_actions.times_s[0, future_actions.event_mask[0]],
+        quality_weight=source_contract.quality_weight,
+        anchor_time_s=anchor_s,
+        target_view_index=target_view_index,
+        valid_view_count=valid_view_count,
+        sample_index=int(sample_index),
+        decode_retry_count=int(decode_retry_count),
     )

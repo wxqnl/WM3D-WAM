@@ -32,6 +32,12 @@ def test_data_config_keeps_renderer_and_action_clocks_separate() -> None:
         15: 24,
         20: 32,
     }
+    assert config.action.max_events == 33
+    assert config.action.max_history_events == 65
+    assert (
+        config.action.padded_capacity_rule
+        == "ceil_duration_times_source_hz_plus_one"
+    )
     assert config.action.interpolation == "forbidden"
     assert config.action.overflow_policy == "reject_window"
 
@@ -40,7 +46,8 @@ def test_runtime_forbids_gpu_zero_and_geometry_bridge_is_a_hard_gate() -> None:
     runtime = OmegaConf.load(ROOT / "configs/train/wm3d_wam_v1.yaml")
     geometry = OmegaConf.load(ROOT / "configs/model/vggt_geometry_v1.yaml")
 
-    assert list(runtime.runtime.visible_cuda_devices) == [1, 2, 3, 4, 5, 6, 7]
+    assert list(runtime.runtime.permitted_cuda_devices) == [1, 2, 3, 4, 5, 6, 7]
+    assert list(runtime.runtime.visible_cuda_devices) == [1, 2, 5, 6, 7]
     assert list(runtime.runtime.forbidden_cuda_devices) == [0]
     assert (
         geometry.future_predictor.integration_status

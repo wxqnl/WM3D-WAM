@@ -1,102 +1,107 @@
-# WM3D-WAM 实现基线与当前状态
+# WM3D-WAM 实现基线与状态
 
 | 项目 | 内容 |
 |---|---|
-| 日期 | 2026-08-19 |
+| 日期 | 2026-08-20 |
 | 分支 | `codex/implement-wm3d-wam-v1` |
-| 当前里程碑 | M2/M3 单卡生产宽度 preflight 完成 |
+| 当前里程碑 | M4，七源五卡 Stage A/B/C canary 完成 |
 | 生产模型配置 | `configs/model/wan_action_mot_v1.yaml` |
-| 数据配置 | `configs/data/grouped_robot_v1.yaml` |
+| 数据合同 | `configs/data/grouped_robot_v1.yaml`、`configs/data/source_contracts_v1.yaml` |
+| 训练配置 | `configs/train/wm3d_wam_v1.yaml` |
 
-## 代码基线
+## 代码基线选择
 
-WM3D-WAM 作为集成入口，按模块复用三套已有实现。没有整体 fork 任意旧
-项目，因为三者都不同时具备 grouped robot ABI、Wan2.2 动作耦合和在线
-VGGT。
+WM3D-WAM 是唯一集成入口，没有整体 fork 某个旧仓库。三个基线各自只负责已经
+验证过的部分：
 
-| 范围 | 基线 | 本项目保留或修改的部分 |
+| 范围 | 基线 | 本仓库采用的实现 |
 |---|---|---|
-| 视频与动作 | FastWAM | Wan2.2 VideoDiT、ActionDiT、30 层 MoT、flow scheduler、observed-video K/V prefill |
-| 数据与时钟 | 原 WM3D | recorded timestamp、grouped robot ABI、source adapter、manifest |
-| 几何 | node 41 VGGT-GAM | VGGT pair 0–3 / 4–23 split、future predictor、action token 插入 deep path |
+| 视频与动作 | FastWAM | Wan2.2 VideoDiT、ActionDiT、30 层 MoT、flow scheduler、observed-video prefill |
+| 数据与时钟 | 原 WM3D | recorded timestamp、grouped robot ABI、adapter、manifest、episode split |
+| 几何 | node 41 VGGT-GAM | VGGT pair 0–3 / 4–23 split、future predictor、deep action token |
 
-Worldscape-MoE 用于参考多源数据组织，不作为代码主干。它缺少本项目采用
-的 Wan2.2 ActionDiT、grouped ABI 和 VGGT split-and-resume 组合。
+Worldscape-MoE 用于核对多源数据组织、采样层级与 source 隔离方式。它不包含本
+项目需要的 Wan2.2 ActionDiT、grouped action ABI 和 VGGT split-and-resume，
+所以没有作为代码主干。
 
-## 已实现的数据路径
+## 数据实现
 
-`scripts/build_episode_splits.py` 已对 21 个 source 物化固定 split。选择单位
-优先使用 manifest 中的 parent trajectory；当前 manifest 没有该字段，所以
-实际单位是 episode。所有 window 都继承 episode split。
+`scripts/build_episode_splits.py` 为 21 个 source 物化固定 split。
+`configs/data/source_contracts_v1.yaml` 再做训练门禁：7 个 verified source 进入
+sampler，14 个 excluded source 保留统计但不能训练。当前有效划分为 527,647
+train、5,383 val、5,383 test episode。
 
-| family | train | val | test | eligible |
-|---|---:|---:|---:|---:|
-| OXE | 128,995 | 1,374 | 1,374 | 131,743 |
-| RoboCasa | 407,327 | 4,156 | 4,156 | 415,639 |
-| 合计 | 536,322 | 5,530 | 5,530 | 547,382 |
+在线 loader 执行以下工作：
 
-在线 loader 只读取 manifest、Parquet 和 MP4：
-
-- 按 recorded timestamp 选择 16 个历史 state、4 个 VGGT 历史 keyframe、
+- 根据 recorded timestamp 选择 16 个历史 state、4 个 VGGT history keyframe、
   4 个未来 geometry anchor 和 9 个 Wan frame；
-- endpoint 允许设计规定的 90% coverage，所有选中图像仍是实际记录帧；
-- past state 与 past action 都以 policy anchor 为时间原点；
-- future action 的半开区间固定为 `[0, 1.6s)`；
-- 5/10/15/20 Hz 分别保留 8/16/24/32 个未来 event，不插值、不重复末值；
-- 不读取任何 VGGT、depth、point、pose 或 Wan latent 派生缓存。
+- 保留实际 V=1/2/3 camera bucket，不插入伪造 view；
+- 通过 manifest PTS seek 和稀疏 row decode 读取 MP4，不解码完整 episode；
+- past action/state 以 policy anchor 为时间原点，future action 使用半开区间
+  `[0,1.6s)`；
+- 保留 5/10/15/20 Hz 原生命令及真实时间戳，不插值、不复制末值；
+- 用 `ceil(duration * source_hz) + 1` 分配 event 容量，容纳 recorded-time
+  边界抖动；
+- 不读取 VGGT、depth、point、pose 或 Wan latent 派生缓存。
 
-固定 ordinal stride 曾漏掉 320 个满足时间覆盖门禁的短 episode。当前
-timestamp selector 已能读取这类 episode；真实 DROID 边界样本保留 48 个
-历史 event、24 个未来 event，最后一帧时间为 1.5333 秒。
+分层 sampler 先选 program、family 和 source，再选 episode、window 与 view。
+FSDP 要求各 rank 走相同模块路径，因此 route 和 tensor schema 按 local sample
+index 同步；具体 episode/window 仍按 rank-specific global sample index 选择。
 
-## 已实现的模型路径
+## 模型实现
 
 ### Online VGGT-GAM
 
-- VGGT pair 0–3 在 forward 内以 `no_grad` 编码历史与 target RGB；
-- grouped history connector 使用全部 16 个 state step 和原生 past-action
-  event，再提取 `[0,5,10,15]` 四个 keyframe summary；
-- 12 层 future predictor 自回归预测 0.4/0.8/1.2/1.6 秒四个 shallow anchor；
+- VGGT pair 0–3 在 forward 内以 `no_grad` 编码历史和 target RGB；
+- grouped history connector 使用全部 16 个 state step 与原生 past-action event；
+- 12 层 future predictor 预测 0.4/0.8/1.2/1.6 秒 shallow anchors；
 - pair 4–23 接收预测 shallow token 与 action seed，输出 deep token、depth、
   world point 和 camera pose；
-- direct predictor seed 与 refined deep action token 都通过 leakage-safe
-  grouped auxiliary head 解码到 `[B,E,G,D]`；
-- clean future RGB 只进入 loss target branch。policy API 拒绝 future factual
-  action，factual API 则要求 candidate future action。
+- direct 与 refined auxiliary head 解码 grouped action；
+- clean future RGB 只进入 detached target branch。
 
-VGGT deep 当前按实际 view 数分桶。带 padding 的 view mask 会报错，避免无效
-camera token 静默进入 deep attention。
+VGGT 是训练计算图中的核心主干。训练不要求先生成 VGGT cache。
 
-### Wan2.2 与 Grouped Action
+### Wan2.2 与 Grouped Action MoT
 
 - Wan2.2 TI2V-5B Video Expert 保留 30 层、hidden 3072、FFN 14336；
 - Grouped Action Expert 使用 30 层、hidden 1024、FFN 4096；
-- Action codec 显式编码 value、semantic、group、composition、embodiment、
-  event timestamp 与 event delta；
-- 两个 expert 每层分别产生 Q/K/V，再执行同一次 mixed attention；
-- geometry 在层 `[5,11,17,23,29]` 作为额外 K/V，不成为 query stream；
-- `action_only` 训练与部署共用 observed-video prefill 路径，cache 数值逐元素
-  一致；
-- `forward_world` 使用 clean candidate action 与 noisy future video；
-- `joint_world_action` 同时使用 noisy action 和 noisy future video。
+- action codec 编码 value、semantic、group、composition、embodiment、event
+  timestamp 和 delta；
+- 两个 expert 每层各自产生 Q/K/V，共享一次 mixed attention，再回到各自的
+  projection 与 FFN；
+- geometry 在层 5/11/17/23/29 作为额外 K/V；
+- `action_only`、`forward_world`、`joint_world_action` 使用各自严格 mask；
+- action-only 训练与部署复用 observed-video prefill cache 路径。
 
-ActionDiT backbone 由本地 Wan2.2 权重离线准备：820 个共享张量中 300 个直接
-复制，520 个按 FastWAM 的逐维线性插值与 alpha scaling 规则得到。grouped
-codec 与输出层独立初始化。
+ActionDiT backbone 从本地 Wan2.2 权重生成：shape 相同的 tensor 直接迁移，
+shape 不同的 tensor 使用 FastWAM 的逐维线性插值与 alpha scaling；grouped
+codec 和输出层单独初始化。
 
-### Loss 与参数归属
+## 训练与恢复实现
 
-- Action 与 video 使用各自的 continuous flow-matching sample、timestep
-  weight 和有效 token 归一化；
-- video latent frame 0 始终保持 clean，video loss 只计算未来 latent；
-- Stage A 使用 future feature、depth/point/pose 和 direct/refined action；
-- Stage B/C 的三个 interaction program 已接入相应 action/video/geometry loss；
-- optimizer group 精确覆盖每个 stage 的 trainable 参数，Wan VAE、UMT5 与
-  VGGT shallow 永久冻结。
+`scripts/train_wm3d_wam.py` 是 Stage A/B/C 的正式入口，提供：
+
+- 多进程在线 Dataset/DataLoader 和可恢复分层 sampler；
+- BF16 forward/reduce、FP32 master weights、FSDP FULL_SHARD；
+- Stage-specific optimizer group、cosine schedule、gradient accumulation、
+  clipping、JSONL metrics 和周期 validation；
+- 数据读取失败的跨 rank readiness handshake；
+- Stage A canonical DTensor DCP；
+- Stage B/C rank-local model、optimizer、scheduler、RNG、cursor checkpoint；
+- exact resume、Stage A→B canonical initialization、B warmup→main→C local
+  initialization；
+- 完成标记、原子 latest 指针和显式 checkpoint retention。
+
+完整阶段的 local shard 要求相同 world size 和相同有序物理 GPU mesh。checkpoint
+元数据记录并校验该列表。Stage A canonical checkpoint 可以重分片到不同 world
+size。
+
+FSDP 只在 root 与完整 `WanActionMoT` 边界切分。VGGT functional block path 和
+MoT 内部 expert 不能单独 auto-wrap，否则 forward 会在参数 gather 边界之外读取
+shard。冻结的 VGGT heads 保持 FP32 并排除出 FSDP；Wan VAE 与 UMT5 永久冻结。
 
 ## 本地资产
-
-训练 worker 只接受完整的本地 bundle，不会调用 Hub 或镜像下载：
 
 ```text
 /data/Minko/models/WM3D-WAM/Wan2.2-TI2V-5B
@@ -105,32 +110,21 @@ codec 与输出层独立初始化。
 /data/Minko/world_model/wm3d_v8_action_experiments/gam_node42_v1/runtime/vggt
 ```
 
-meta-device loader 已处理 Wan VAE normalization constant 与 Wan RoPE table
-这两类不在 checkpoint 中的 runtime constant。相关回归测试覆盖真实
-materialization，而不只检查 state-dict key。
+worker 只接受完整本地 bundle，不调用 Hub 或镜像下载。loader 已处理 Wan VAE
+normalization constant 与 Wan RoPE table 这两类 checkpoint 之外的 runtime
+constant。
 
-## 当前验证
+## 当前验证结论
 
-- 48 个 CPU 单元与合同测试通过；
-- 真实 OXE Bridge Stage A forward/backward 通过；
-- 真实 OXE Bridge action-only forward/backward、target leakage 与 cache parity
-  通过；
-- 真实 RoboCasa Atomic 20 Hz forward-world 通过；
-- 单独反传 Action loss 时 Wan DiT 获得非零梯度；
-- joint program 单独反传 video loss 时 Action Expert 获得非零梯度；
-- 固定真实窗口与固定 flow noise 的 3-step AdamW loss 从 1.9619 降到
-  1.8393。
+- 59 个 CPU 合同测试通过；
+- 单卡真实数据的 Stage A、三种 interaction program、cache parity、target
+  leakage、双向梯度归因和三步短拟合通过；
+- Stage A 双卡保存并精确恢复到下一步；
+- Stage B warmup 五卡完成 forward-world、joint、action-only，且跨进程恢复；
+- Stage B main 五卡解冻 Wan/VGGT deep 并保存完整 checkpoint；
+- Stage C 五卡完成 train、validation 和 checkpoint；
+- 当前正式 mesh `1,2,5,6,7` 的峰值显存低于 80 GiB。
 
-完整数值见 [EXPERIMENTS.md](EXPERIMENTS.md)。
-
-## 尚未完成的正式训练门禁
-
-1. 多个 v4 adapter 仍使用通用 `controller_command/controller_state`，尚未逐
-   source 确认单位、坐标系、composition operator 与 gripper polarity。
-2. 当前 preflight 是单卡生产宽度计算图；七卡 FSDP launcher、编号 checkpoint、
-   optimizer/scheduler/sampler cursor 与 RNG 恢复还未做 canary。
-3. source/objective 分层 sampler、完整吞吐 profile、baseline 和正式评测尚未运行。
-4. 严格 task-OOD 需要可信离散 task ID。当前只保留 unseen-text probe，不用
-   自由文本归一化冒充严格 task-OOD。
-
-这些门禁不会通过扁平 action fallback、派生 geometry cache 或缩小模型绕过。
+详细数值见 [EXPERIMENTS.md](EXPERIMENTS.md)，启动和恢复命令见
+[TRAINING.md](TRAINING.md)。代码已具备七源正式训练条件。尚未完成的是正式长训
+后的策略评测，以及 14 个 excluded source 的 payload-level 控制合同审计。
