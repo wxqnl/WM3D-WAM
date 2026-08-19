@@ -1,0 +1,55 @@
+_target_: wm3d_wam.models.WanActionMoT
+mot_checkpoint_mixed_attn: true
+
+video_expert:
+  _target_: wm3d_wam.vendor.fastwam.wan22.WanVideoDiT
+  has_image_input: false
+  patch_size: [1, 2, 2]
+  in_dim: 48
+  hidden_dim: 3072
+  ffn_dim: 14336
+  freq_dim: 256
+  text_dim: 4096
+  out_dim: 48
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  eps: 1.0e-06
+  seperated_timestep: true
+  require_clip_embedding: false
+  require_vae_embedding: false
+  fuse_vae_embedding_in_latents: true
+  action_conditioned: false
+  video_attention_mask_mode: first_frame_causal
+  use_gradient_checkpointing: true
+
+action_expert:
+  _target_: wm3d_wam.models.GroupedActionFlowExpert
+  hidden_dim: 1024
+  ffn_dim: 4096
+  text_dim: 4096
+  freq_dim: 256
+  eps: 1.0e-06
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  use_gradient_checkpointing: true
+  codec_config:
+    hidden_dim: 1024
+    max_groups: 8
+    max_action_dim: 16
+    semantic_vocab_size: 128
+    group_vocab_size: 256
+    composition_vocab_size: 32
+    embodiment_vocab_size: 4096
+    time_fourier_dim: 128
+    time_max_frequency_hz: 64.0
+    eps: 1.0e-06
+
+geometry_adapters:
+  _target_: wm3d_wam.models.SparseGeometryKVAdapters
+  geometry_dim: 1024
+  num_heads: 24
+  attention_head_dim: 128
+  fusion_layers: [5, 11, 17, 23, 29]
+  eps: 1.0e-06

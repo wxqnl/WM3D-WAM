@@ -1,0 +1,36 @@
+schema: wm3d_wam_grouped_robot_v1
+
+window:
+  observation_horizon_s: 3.2
+  future_horizon_s: 1.6
+  renderer_hz: 5
+  video_frames: 9
+  vggt_observed_positions: [0, 5, 10, 15]
+  vggt_future_times_s: [0.4, 0.8, 1.2, 1.6]
+  maximum_video_pts_error_s: 0.05
+  minimum_end_coverage: 0.9
+
+action:
+  preserve_source_native_clock: true
+  allowed_rates_hz: [5, 10, 15, 20]
+  events_per_window:
+    5: 8
+    10: 16
+    15: 24
+    20: 32
+  max_events: 32
+  max_groups: 8
+  max_substeps_per_renderer_interval: 4
+  max_action_dim: 16
+  max_state_dim: 32
+  interpolation: forbidden
+  repetition: forbidden
+  overflow_policy: reject_window
+
+views:
+  roles: [primary_external, secondary_external, wrist]
+  target_probabilities: [0.5, 0.25, 0.25]
+  spatial_buckets:
+    - [256, 256]
+    - [192, 256]
+    - [160, 288]

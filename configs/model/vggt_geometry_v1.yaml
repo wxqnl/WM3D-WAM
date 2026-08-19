@@ -1,0 +1,39 @@
+# The encoder target is runnable after VGGT source and weights are provisioned.
+encoder:
+  _target_: wm3d_wam.vendor.vggt_gam.vggt_encoder.VGGTEncoder
+  ckpt_path: ${oc.env:VGGT_CKPT}
+  source_root: ${oc.env:VGGT_SOURCE_ROOT}
+  encoder_input_size: 224
+  split_layer: 4
+  freeze_backbone: false
+  n_action_steps: 0
+  views_per_timestep: 3
+  action_steps_per_token: 1
+  use_temporal_embed: false
+  action_input_rate: 0.4
+  action_only_frame_attn: false
+  deep_time_mode: causal
+  local_files_only: true
+
+# This records the selected node-41 GAM predictor. The grouped history bridge
+# is deliberately a hard implementation gate; training must not replace it
+# with a flattened source-specific action vector.
+future_predictor:
+  reference_target: wm3d_wam.vendor.vggt_gam.future_predictor.GAMFuturePredictor
+  integration_status: grouped_history_bridge_required
+  d_da3: 1024
+  d_model: 1024
+  depth: 12
+  num_heads: 16
+  ffn_ratio: 4.0
+  dropout: 0.0
+  num_patches_per_view: 256
+  num_register_tokens: 4
+  use_language: true
+  language_dim: 4096
+  language_len: 128
+  condition_mode: cross_attn
+  input_proj_norm: ln
+  gradient_checkpointing: true
+  observed_keyframes: 4
+  future_anchor_times_s: [0.4, 0.8, 1.2, 1.6]

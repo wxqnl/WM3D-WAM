@@ -1,0 +1,30 @@
+runtime:
+  visible_cuda_devices: [1, 2, 3, 4, 5, 6, 7]
+  forbidden_cuda_devices: [0]
+  nproc_per_node: 7
+  precision: bf16
+  fsdp: full_shard
+  activation_checkpointing: true
+  micro_batch_per_gpu: 1
+  gradient_accumulation_steps: 4
+  effective_global_batch: 28
+
+optimizer:
+  name: adamw
+  betas: [0.9, 0.95]
+  max_grad_norm: 1.0
+  warmup_steps: 500
+  schedule: cosine
+
+stages:
+  geometry_gam:
+    steps: 30000
+    program: geometry_pretrain
+    family_mix: {oxe: 0.7, robocasa: 0.3}
+  wan_action:
+    steps: 40000
+    warmup_steps: 2000
+    program_mix: {action_only: 0.5, forward_world: 0.3, joint_world_action: 0.2}
+  tri_stream_alignment:
+    steps: 20000
+    program_mix: {action_only: 0.4, forward_world: 0.3, joint_world_action: 0.3}

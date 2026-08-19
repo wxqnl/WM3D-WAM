@@ -2,15 +2,19 @@
 
 | 项目 | 内容 |
 |---|---|
-| 状态 | Revision 2，进入实现前评审 |
+| 状态 | Revision 2，M1 实现中 |
 | 日期 | 2026-08-19 |
 | 目标仓库 | wxqnl/WM3D-WAM |
-| 当前分支 | codex/design-wm3d-wam-v1 |
+| 当前分支 | codex/implement-wm3d-wam-v1 |
 | 核心模型 | 在线 VGGT 几何主干 + Wan2.2 视频专家 + Grouped Action Flow Expert |
 | 预测范围 | 1.6 秒 |
 | 视频时钟 | 全部 source 统一为 5 Hz / 9 帧 |
 | 动作时钟 | 保留 source-native 5 / 10 / 15 / 20 Hz |
 | 训练设备 | New-H100-2 的 GPU 1–7；GPU 0 禁用 |
+
+实现基线、已完成模块和硬门禁见
+[IMPLEMENTATION_BASE.md](IMPLEMENTATION_BASE.md)。本文件继续作为 v1 的
+架构与数据合同，阶段性实现不得通过弱化这些合同来换取可运行状态。
 
 ## 0. 本次修订解决什么
 

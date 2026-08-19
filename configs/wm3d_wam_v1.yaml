@@ -1,0 +1,8 @@
+defaults:
+  - data: grouped_robot_v1
+  - model: wan_action_mot_v1
+  - train: wm3d_wam_v1
+  - _self_
+
+project: wm3d_wam
+geometry_config: model/vggt_geometry_v1.yaml
