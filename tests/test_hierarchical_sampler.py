@@ -1,8 +1,6 @@
-from dataclasses import replace
 from pathlib import Path
 
 from wm3d_wam.data.hierarchical_sampler import (
-    PROGRAM_FAMILY_MIX,
     RecoverableHierarchicalSampler,
     source_sampling_weights,
 )
@@ -54,7 +52,7 @@ def test_distributed_ranks_never_share_a_global_sample_index():
             episode_counts=counts,
             contracts=contracts,
             profile_weights=profile,
-            program_mix={"geometry_pretrain": 1.0},
+            program_mix={"world_core_pretrain": 1.0},
             seed=7,
             rank=rank,
             world_size=4,

@@ -1,4 +1,4 @@
-"""Grouped state/action history connector for GAMFuturePredictor."""
+"""Grouped state/action history connector for the WM3D state core."""
 
 from __future__ import annotations
 
@@ -158,8 +158,8 @@ class GroupedHistoryConnector(nn.Module):
 
     State and source-native action events are encoded independently, then an
     interleaved block-causal transformer lets every selected keyframe summary
-    carry the complete earlier robot history.  The output can be passed to the
-    GAM predictor through its pre-embedded grouped-history API.
+    carry the complete earlier robot history. The two summaries condition the
+    action-free state prior and the factual dynamics branch, respectively.
     """
 
     def __init__(

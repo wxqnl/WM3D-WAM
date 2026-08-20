@@ -9,15 +9,17 @@ import torch
 import yaml
 
 from wm3d_wam.vendor.fastwam.wan22.wan_video_dit import WanVideoDiT
-from wm3d_wam.vendor.vggt_gam.future_predictor import GAMFuturePredictor
 from wm3d_wam.vendor.vggt_gam.vggt_encoder import VGGTEncoder
 
 from .geometry_adapters import SparseGeometryKVAdapters
-from .geometry_action_heads import GroupedGeometryActionHeads
 from .grouped_action_flow import GroupedActionFlowExpert, load_grouped_action_backbone
 from .grouped_history import GroupedHistoryConnector
 from .online_vggt_geometry import OnlineVGGTGeometryCore
 from .wan_action_mot import WanActionMoT
+from .wm3d_state_dynamics import (
+    WM3DStateDynamicsConfig,
+    WM3DStateDynamicsCore,
+)
 
 
 def load_yaml_mapping(path: str | Path) -> dict[str, Any]:
@@ -81,7 +83,7 @@ def build_online_geometry_core(
     device: torch.device | str,
     dtype: torch.dtype = torch.bfloat16,
 ) -> OnlineVGGTGeometryCore:
-    """Materialize the online split-and-resume VGGT-GAM core."""
+    """Materialize online VGGT around the original-WM3D state core."""
 
     encoder_config = _section(geometry_config, "encoder")
     encoder_config.update(
@@ -91,25 +93,26 @@ def build_online_geometry_core(
             "views_per_timestep": int(views_per_timestep),
         }
     )
-    predictor_config = _section(geometry_config, "future_predictor")
-    for key in (
-        "reference_target",
-        "integration_status",
-        "observed_keyframes",
-        "future_anchor_times_s",
-    ):
-        predictor_config.pop(key, None)
     history_config = _section(geometry_config, "history_connector")
-    auxiliary_config = _section(geometry_config, "auxiliary_action_heads")
+    state_config = _section(geometry_config, "state_dynamics")
     observed_keyframes = tuple(
         int(value)
         for value in geometry_config.get(
             "observed_keyframe_indices", (0, 5, 10, 15)
         )
     )
-    future_anchor_count = int(geometry_config.get("future_anchor_count", 4))
+    future_steps = int(geometry_config.get("future_steps", 16))
+    geometry_anchor_indices = tuple(
+        int(value)
+        for value in geometry_config.get(
+            "geometry_anchor_indices", (3, 7, 11, 15)
+        )
+    )
     geometry_output_patch_grid = int(
         geometry_config.get("geometry_output_patch_grid", 4)
+    )
+    shallow_scene_chunk_size = int(
+        geometry_config.get("shallow_scene_chunk_size", 8)
     )
 
     encoder = VGGTEncoder(**encoder_config).to(device=device, dtype=dtype)
@@ -117,24 +120,34 @@ def build_online_geometry_core(
     torch.set_default_dtype(dtype)
     try:
         with torch.device(device):
-            predictor = GAMFuturePredictor(**predictor_config)
             connector = GroupedHistoryConnector(
                 history_config,
                 action_codec_config=action_codec_config,
             )
-            auxiliary_heads = GroupedGeometryActionHeads(
-                codec_config=action_codec_config,
-                future_anchor_count=future_anchor_count,
-                **auxiliary_config,
+            state_config.update(
+                {
+                    "observed_steps": len(observed_keyframes),
+                    "future_steps": future_steps,
+                    "token_count": (
+                        1 + encoder.num_register_tokens + encoder.num_patches
+                    ),
+                    "token_dim": encoder.embed_dim,
+                    "max_views": int(views_per_timestep),
+                    "history_dim": connector.config.d_model,
+                }
+            )
+            state_dynamics = WM3DStateDynamicsCore(
+                WM3DStateDynamicsConfig(**state_config)
             )
             core = OnlineVGGTGeometryCore(
                 encoder=encoder,
-                future_predictor=predictor,
+                state_dynamics=state_dynamics,
                 history_connector=connector,
-                auxiliary_action_heads=auxiliary_heads,
                 observed_keyframe_indices=observed_keyframes,
-                future_anchor_count=future_anchor_count,
+                future_steps=future_steps,
+                geometry_anchor_indices=geometry_anchor_indices,
                 geometry_output_patch_grid=geometry_output_patch_grid,
+                shallow_scene_chunk_size=shallow_scene_chunk_size,
             )
     finally:
         torch.set_default_dtype(previous_dtype)

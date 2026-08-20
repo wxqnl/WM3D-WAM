@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the production Stage-A online VGGT-GAM graph on real RGB/robot data."""
+"""Run the production WM3D world-core graph on real RGB/robot data."""
 
 from __future__ import annotations
 
@@ -15,9 +15,9 @@ from wm3d_wam.assets import encode_local_wan_prompts, load_local_wan_components
 from wm3d_wam.data.online_episode import first_eligible_episode, load_online_robot_window
 from wm3d_wam.data.source_contracts import NormalizationRegistry, SourceContractRegistry
 from wm3d_wam.models.factory import build_online_geometry_core, load_yaml_mapping
-from wm3d_wam.training.geometry_pipeline import GeometryPretrainingPipeline
+from wm3d_wam.training.geometry_pipeline import WorldCorePretrainingPipeline
 from wm3d_wam.training.parameter_groups import (
-    configure_geometry_pretraining_parameter_groups,
+    configure_world_core_pretraining_parameter_groups,
 )
 
 
@@ -69,6 +69,7 @@ def main() -> None:
         episode=episode,
         source_contract=contract,
         normalization=normalization,
+        program="world_core_pretrain",
     )
     data_seconds = time.perf_counter() - start
     model_config = load_yaml_mapping(args.model_config)
@@ -106,8 +107,8 @@ def main() -> None:
         dtype=dtype,
     )
     build_seconds = _sync_elapsed(start)
-    groups = configure_geometry_pretraining_parameter_groups(core)
-    pipeline = GeometryPretrainingPipeline(core).train()
+    groups = configure_world_core_pretraining_parameter_groups(core)
+    pipeline = WorldCorePretrainingPipeline(core).train()
     window = window.to(device=device, dtype=dtype)
 
     start = time.perf_counter()
@@ -140,6 +141,25 @@ def main() -> None:
                     sum(value.float().norm().item() for value in values)
                 ),
             }
+        for owner, module in {
+            "state_prior": core.state_dynamics.state_blocks,
+            "factual_dynamics": core.state_dynamics.dynamics_blocks,
+            "vggt_token_decoder": core.state_dynamics.token_decoder,
+        }.items():
+            values = [
+                parameter.grad
+                for parameter in module.parameters()
+                if parameter.grad is not None
+            ]
+            gradients[f"owner/{owner}"] = {
+                "tensors": len(values),
+                "finite": bool(
+                    values and all(torch.isfinite(value).all() for value in values)
+                ),
+                "summed_norm": float(
+                    sum(value.float().norm().item() for value in values)
+                ),
+            }
 
     result = {
         "physical_gpu": args.physical_gpu,
@@ -158,8 +178,10 @@ def main() -> None:
         "forward_seconds": forward_seconds,
         "backward_seconds": backward_seconds,
         "losses": output.detached_metrics(),
-        "direct_action_shape": list(output.auxiliary_actions.direct.shape),
-        "refined_action_shape": list(output.auxiliary_actions.refined.shape),
+        "predicted_world_shape": list(
+            output.geometry.predicted_future_shallow_tokens.shape
+        ),
+        "native_state_shape": list(output.geometry.native_state.shape),
         "target_shallow_detached": bool(
             output.geometry.target_future_shallow_tokens is not None
             and not output.geometry.target_future_shallow_tokens.requires_grad

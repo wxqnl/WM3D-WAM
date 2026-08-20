@@ -46,6 +46,8 @@ def test_registry_accounts_for_all_21_sources_and_hard_excludes_ambiguous_payloa
     }
     with pytest.raises(SourceContractError, match="excluded"):
         registry.require("oxe_austin_buds", program="action_only")
+    with pytest.raises(SourceContractError, match="not approved"):
+        registry.require("oxe_bridge", program="forward_world")
 
 
 def test_robocasa_groups_and_gripper_roundtrip():

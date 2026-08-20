@@ -14,7 +14,10 @@ sources:
     raw_action_dim: 7
     raw_state_dim: 8
     status: verified
-    programs: [geometry_pretrain, action_only, forward_world, joint_world_action]
+    # 5 Hz supplies eight real future observations over 1.6 s. It supervises
+    # the corresponding K-grid slots and action-only prediction, but cannot
+    # enter Wan video-flow routes that require 17 distinct 10 Hz frames.
+    programs: [world_core_pretrain, action_only]
     quality_weight: 0.95
     ignored_action_indices: []
     ignored_state_indices: [6]
@@ -54,7 +57,7 @@ sources:
     raw_action_dim: 8
     raw_state_dim: 8
     status: verified
-    programs: [geometry_pretrain, action_only, forward_world, joint_world_action]
+    programs: [world_core_pretrain, action_only, forward_world, joint_world_action]
     quality_weight: 1.0
     ignored_action_indices: []
     ignored_state_indices: []
@@ -331,7 +334,7 @@ sources:
     raw_action_dim: 7
     raw_state_dim: 8
     status: verified
-    programs: [geometry_pretrain, action_only, forward_world, joint_world_action]
+    programs: [world_core_pretrain, action_only, forward_world, joint_world_action]
     quality_weight: 1.0
     ignored_action_indices: []
     ignored_state_indices: []
@@ -371,7 +374,7 @@ sources:
     raw_action_dim: 7
     raw_state_dim: 8
     status: verified
-    programs: [geometry_pretrain, action_only, forward_world, joint_world_action]
+    programs: [world_core_pretrain, action_only, forward_world, joint_world_action]
     quality_weight: 0.95
     ignored_action_indices: []
     ignored_state_indices: [6]
@@ -411,7 +414,7 @@ sources:
     raw_action_dim: 12
     raw_state_dim: 16
     status: verified
-    programs: [geometry_pretrain, action_only, forward_world, joint_world_action]
+    programs: [world_core_pretrain, action_only, forward_world, joint_world_action]
     quality_weight: 1.0
     ignored_action_indices: []
     ignored_state_indices: []
@@ -482,7 +485,7 @@ sources:
     raw_action_dim: 12
     raw_state_dim: 16
     status: verified
-    programs: [geometry_pretrain, action_only, forward_world, joint_world_action]
+    programs: [world_core_pretrain, action_only, forward_world, joint_world_action]
     quality_weight: 1.0
     ignored_action_indices: []
     ignored_state_indices: []
@@ -499,7 +502,7 @@ sources:
     raw_action_dim: 12
     raw_state_dim: 16
     status: verified
-    programs: [geometry_pretrain, action_only, forward_world, joint_world_action]
+    programs: [world_core_pretrain, action_only, forward_world, joint_world_action]
     quality_weight: 1.0
     ignored_action_indices: []
     ignored_state_indices: []

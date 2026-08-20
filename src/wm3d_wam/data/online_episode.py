@@ -42,21 +42,24 @@ class OnlineEpisodeError(RuntimeError):
 
 @dataclass(frozen=True)
 class OnlineRobotWindow:
+    program: str
     source: str
     source_id: int
     episode_id: str
     task_text: str
     observed_images: torch.Tensor             # [4,V,3,224,224]
-    future_anchor_images: torch.Tensor         # [4,V,3,224,224]
-    wan_video: torch.Tensor                    # [3,9,256,256]
+    future_world_images: torch.Tensor          # [16,V,3,224,224]
+    wan_video: torch.Tensor                    # [3,1|17,256,256]
     observed_view_valid_mask: torch.Tensor     # [4,V]
-    future_view_valid_mask: torch.Tensor       # [4,V]
+    future_view_valid_mask: torch.Tensor       # [16,V], predicted camera slots
+    future_world_valid_mask: torch.Tensor      # [16,V], recorded RGB targets
     state_history: GroupedStateHistoryBatch
     action_history: GroupedActionTimelineBatch
     future_action_history: GroupedActionTimelineBatch
     future_actions: GroupedActionBatch
     observation_times_s: torch.Tensor          # [16], relative to anchor
-    future_video_times_s: torch.Tensor         # [9], relative to anchor
+    future_world_times_s: torch.Tensor          # [16], 0.1..1.6 s
+    future_video_times_s: torch.Tensor          # [1|17], relative to anchor
     action_history_times_s: torch.Tensor
     future_action_times_s: torch.Tensor
     quality_weight: float
@@ -74,7 +77,11 @@ class OnlineRobotWindow:
     def view_count(self) -> int:
         """Exact real camera count for this sample."""
 
-        return int(self.observed_images.shape[1])
+        return int(
+            self.observed_images.shape[2]
+            if self.observed_images.ndim == 6
+            else self.observed_images.shape[1]
+        )
 
     def to(
         self,
@@ -86,6 +93,7 @@ class OnlineRobotWindow:
 
         float_dtype = dtype or self.observed_images.dtype
         return OnlineRobotWindow(
+            program=self.program,
             source=self.source,
             source_id=self.source_id,
             episode_id=self.episode_id,
@@ -93,7 +101,7 @@ class OnlineRobotWindow:
             observed_images=self.observed_images.to(
                 device=device, dtype=float_dtype
             ),
-            future_anchor_images=self.future_anchor_images.to(
+            future_world_images=self.future_world_images.to(
                 device=device, dtype=float_dtype
             ),
             wan_video=self.wan_video.to(device=device, dtype=float_dtype),
@@ -101,6 +109,7 @@ class OnlineRobotWindow:
                 device=device
             ),
             future_view_valid_mask=self.future_view_valid_mask.to(device=device),
+            future_world_valid_mask=self.future_world_valid_mask.to(device=device),
             state_history=self.state_history.to(device=device, dtype=float_dtype),
             action_history=self.action_history.to(device=device, dtype=float_dtype),
             future_action_history=self.future_action_history.to(
@@ -110,6 +119,9 @@ class OnlineRobotWindow:
                 device=device, dtype=float_dtype
             ),
             observation_times_s=self.observation_times_s.to(
+                device=device, dtype=float_dtype
+            ),
+            future_world_times_s=self.future_world_times_s.to(
                 device=device, dtype=float_dtype
             ),
             future_video_times_s=self.future_video_times_s.to(
@@ -234,7 +246,7 @@ def _mapped(accessor: ParquetEpisodeAccessor, terms: list[dict[str, Any]]) -> np
     return result
 
 
-def _decode_video_rows(
+def _decode_video_rows_impl(
     path: Path,
     *,
     start_s: float,
@@ -330,6 +342,32 @@ def _decode_video_rows(
     return output
 
 
+def _decode_video_rows(
+    path: Path,
+    *,
+    start_s: float,
+    stop_s: float,
+    observation_times_s: np.ndarray,
+    rows: np.ndarray,
+) -> np.ndarray:
+    """Convert corrupt PyAV bitstreams into deterministic retryable errors."""
+
+    import av
+
+    try:
+        return _decode_video_rows_impl(
+            path,
+            start_s=start_s,
+            stop_s=stop_s,
+            observation_times_s=observation_times_s,
+            rows=rows,
+        )
+    except av.FFmpegError as exc:
+        raise OnlineEpisodeError(
+            f"PyAV failed to decode {Path(path)}: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
 def _resize_center_crop(frames: np.ndarray, size: int) -> torch.Tensor:
     tensor = torch.from_numpy(frames.copy()).permute(0, 3, 1, 2).float() / 255.0
     height, width = tensor.shape[-2:]
@@ -423,9 +461,18 @@ def _select_recorded_window(
     observation_times: np.ndarray,
     *,
     anchor_fraction: float,
+    source_hz: int,
 ):
     if not np.isfinite(anchor_fraction) or not 0.0 <= anchor_fraction < 1.0:
         raise OnlineEpisodeError("anchor_fraction must be finite in [0,1)")
+    source_hz = int(source_hz)
+    if source_hz < 5 or source_hz % 5:
+        raise OnlineEpisodeError("source clock is incompatible with WM3D-WAM")
+    # The latent world grid is always K=16 at 10 Hz. A genuine 5 Hz source
+    # contributes its eight recorded future states to grid slots 1,3,...,15;
+    # the other slots remain explicitly unsupervised rather than duplicated.
+    future_samples = 8 if source_hz == 5 else 16
+    future_dt_s = 0.2 if source_hz == 5 else 0.1
     row_count = int(observation_times.shape[0])
     desired = min(row_count - 1, int(np.floor(anchor_fraction * row_count)))
     for offset in range(row_count):
@@ -439,11 +486,14 @@ def _select_recorded_window(
                 observation_times,
                 anchor_index=anchor_row,
                 context_samples=16,
-                future_samples=8,
+                future_samples=future_samples,
                 context_horizon_s=3.2,
                 future_horizon_s=1.6,
                 minimum_horizon_coverage=0.9,
-                future_offsets_s=np.arange(1, 9, dtype=np.float64) * 0.2,
+                future_offsets_s=(
+                    np.arange(1, future_samples + 1, dtype=np.float64)
+                    * future_dt_s
+                ),
             )
         except WindowSelectionError:
             continue
@@ -479,6 +529,7 @@ def load_online_robot_window(
     episode: dict[str, Any],
     source_contract: SourceContract,
     normalization: NormalizationRegistry,
+    program: str,
     anchor_fraction: float = 0.0,
     target_view_fraction: float = 0.0,
     sample_index: int = -1,
@@ -500,6 +551,11 @@ def load_online_robot_window(
         )
     if str(episode.get("source", "")) != source_contract.name:
         raise OnlineEpisodeError("episode source and semantic contract do not match")
+    program = str(program)
+    if program not in source_contract.programs:
+        raise OnlineEpisodeError(
+            f"source {source_contract.name!r} is not approved for {program!r}"
+        )
     source_hz = source_contract.source_hz
     if int(source_hz) % 5:
         raise OnlineEpisodeError("source contract frequency is not renderer-compatible")
@@ -541,7 +597,9 @@ def load_online_robot_window(
         raise OnlineEpisodeError("robot clocks do not align with episode rows")
 
     selected_window = _select_recorded_window(
-        observation_times, anchor_fraction=anchor_fraction
+        observation_times,
+        anchor_fraction=anchor_fraction,
+        source_hz=source_hz,
     )
     state_rows = selected_window.context_indices
     future_rows = selected_window.future_indices
@@ -553,17 +611,40 @@ def load_online_robot_window(
     history_stop_s = anchor_s
     future_stop_s = anchor_s + 1.6
     keyframe_rows = state_rows[np.asarray([0, 5, 10, 15])]
-    future_video_rows = np.concatenate(
-        [np.asarray([anchor_row], dtype=np.int64), future_rows]
+    future_grid_indices = (
+        np.arange(1, 16, 2, dtype=np.int64)
+        if int(source_hz) == 5
+        else np.arange(16, dtype=np.int64)
     )
-    future_anchor_rows = future_rows[np.asarray([1, 3, 5, 7])]
-    geometry_rows = np.concatenate([keyframe_rows, future_anchor_rows])
-    decoded_rows = np.unique(np.concatenate([geometry_rows, future_video_rows]))
+    if future_rows.shape != future_grid_indices.shape:
+        raise RuntimeError("future row selection does not match the 10 Hz grid map")
+    needs_future_targets = program in {
+        "world_core_pretrain",
+        "forward_world",
+        "joint_world_action",
+    }
+    needs_wan_future = program in {"forward_world", "joint_world_action"}
+    if needs_wan_future and int(source_hz) < 10:
+        raise OnlineEpisodeError(
+            "video-flow programs require 17 distinct real frames at >=10 Hz"
+        )
+    target_rows = future_rows if needs_future_targets else np.empty(0, dtype=np.int64)
+    future_video_rows = (
+        np.concatenate((np.asarray([anchor_row], dtype=np.int64), future_rows))
+        if needs_wan_future
+        else np.asarray([anchor_row], dtype=np.int64)
+    )
+    decoded_rows = np.unique(
+        np.concatenate((keyframe_rows, target_rows, future_video_rows))
+    )
     decoded_row_positions = {
         int(row): index for index, row in enumerate(decoded_rows.tolist())
     }
-    geometry_positions = np.asarray(
-        [decoded_row_positions[int(row)] for row in geometry_rows], dtype=np.int64
+    observed_positions = np.asarray(
+        [decoded_row_positions[int(row)] for row in keyframe_rows], dtype=np.int64
+    )
+    target_positions = np.asarray(
+        [decoded_row_positions[int(row)] for row in target_rows], dtype=np.int64
     )
     wan_positions = np.asarray(
         [decoded_row_positions[int(row)] for row in future_video_rows], dtype=np.int64
@@ -576,7 +657,8 @@ def load_online_robot_window(
     view_specs = list(episode["views"])[: int(max_views)]
     if not view_specs:
         raise OnlineEpisodeError("episode has no manifest-bound RGB views")
-    selected_by_view: list[torch.Tensor] = []
+    observed_by_view: list[torch.Tensor] = []
+    future_by_view: list[torch.Tensor] = []
     selected_wan: torch.Tensor | None = None
     target_view_index = _choose_target_view(
         len(view_specs), target_view_fraction
@@ -598,16 +680,26 @@ def load_online_robot_window(
         )
         if adapter_view is not None and adapter_view.get("color_order", "rgb") == "bgr":
             frames = frames[..., ::-1].copy()
-        selected_by_view.append(
-            _resize_center_crop(frames[geometry_positions], vggt_size)
+        observed_by_view.append(
+            _resize_center_crop(frames[observed_positions], vggt_size)
         )
+        future = torch.zeros(
+            (16, 3, vggt_size, vggt_size), dtype=torch.float32
+        )
+        if target_positions.size:
+            resized_future = _resize_center_crop(
+                frames[target_positions], vggt_size
+            )
+            future[torch.from_numpy(future_grid_indices)] = resized_future
+        future_by_view.append(future)
         if view_index == target_view_index:
             selected_wan = _resize_center_crop(frames[wan_positions], wan_size)
-    valid_view_count = len(selected_by_view)
+    valid_view_count = len(observed_by_view)
     # Micro-batch size is one, so retain the exact real camera bucket instead
     # of inserting synthetic images.  VGGT weights are view-count agnostic and
     # the encoder executes the sample's dynamic V=1/2/3 layout.
-    stacked = torch.stack(selected_by_view, dim=1)  # [8,V,3,H,W]
+    observed_images = torch.stack(observed_by_view, dim=1)
+    future_world_images = torch.stack(future_by_view, dim=1)
     if selected_wan is None:
         raise RuntimeError("primary Wan view was not decoded")
 
@@ -646,7 +738,7 @@ def load_online_robot_window(
         (observation_times[history_boundary_rows] - anchor_s).astype(np.float32)
     ).unsqueeze(0)
     future_boundaries = torch.from_numpy(
-        np.arange(5, dtype=np.float32) * np.float32(0.4)
+        np.arange(17, dtype=np.float32) * np.float32(0.1)
     ).unsqueeze(0)
     history_timeline = assign_action_events_to_steps(
         history_actions, step_boundaries_s=history_boundaries
@@ -662,22 +754,32 @@ def load_online_robot_window(
         embodiment_id=source_contract.embodiment_id,
     )
     observed_view_mask = torch.ones((4, valid_view_count), dtype=torch.bool)
-    future_view_mask = torch.ones((4, valid_view_count), dtype=torch.bool)
+    future_view_mask = torch.ones((16, valid_view_count), dtype=torch.bool)
+    future_world_mask = torch.zeros(
+        (16, valid_view_count), dtype=torch.bool
+    )
+    if needs_future_targets:
+        future_world_mask[torch.from_numpy(future_grid_indices)] = True
     return OnlineRobotWindow(
+        program=program,
         source=str(episode["source"]),
         source_id=source_contract.source_id,
         episode_id=str(episode["episode_id"]),
         task_text=str(episode.get("task_text", "")),
-        observed_images=stacked[:4],
-        future_anchor_images=stacked[4:],
+        observed_images=observed_images,
+        future_world_images=future_world_images,
         wan_video=selected_wan.permute(1, 0, 2, 3).contiguous(),
         observed_view_valid_mask=observed_view_mask,
         future_view_valid_mask=future_view_mask,
+        future_world_valid_mask=future_world_mask,
         state_history=state_history,
         action_history=history_timeline,
         future_action_history=future_timeline,
         future_actions=future_actions,
         observation_times_s=state_history.times_s[0],
+        future_world_times_s=(
+            torch.arange(1, 17, dtype=torch.float32) * 0.1
+        ),
         future_video_times_s=torch.from_numpy(
             (observation_times[future_video_rows] - anchor_s).astype(np.float32)
         ),

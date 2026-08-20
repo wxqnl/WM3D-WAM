@@ -1,4 +1,4 @@
-"""Batched grouped robot history for the online VGGT-GAM path."""
+"""Batched grouped robot history for the online WM3D/VGGT path."""
 
 from __future__ import annotations
 

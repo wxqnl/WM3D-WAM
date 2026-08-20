@@ -3,10 +3,13 @@ schema: wm3d_wam_grouped_robot_v1
 window:
   observation_horizon_s: 3.2
   future_horizon_s: 1.6
-  renderer_hz: 5
-  video_frames: 9
+  world_hz: 10
+  future_steps: 16
+  video_frames: 17
   vggt_observed_positions: [0, 5, 10, 15]
-  vggt_future_times_s: [0.4, 0.8, 1.2, 1.6]
+  vggt_geometry_anchor_indices: [3, 7, 11, 15]
+  five_hz_world_valid_indices: [1, 3, 5, 7, 9, 11, 13, 15]
+  five_hz_missing_slot_policy: masked_no_repeat_no_interpolation
   maximum_video_pts_error_s: 0.05
   minimum_end_coverage: 0.9
 

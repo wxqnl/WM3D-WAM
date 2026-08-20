@@ -4,103 +4,98 @@
 |---|---|
 | 日期 | 2026-08-20 |
 | 分支 | `codex/implement-wm3d-wam-v1` |
-| 当前里程碑 | M4，七源五卡 Stage A/B/C canary 完成，七卡 Stage A 正式训练已启动 |
-| 生产模型配置 | `configs/model/wan_action_mot_v1.yaml` |
+| 设计版本 | Revision 4，WM3D core + K=16 |
+| 训练机器 | New-H100-2，物理 GPU 1–7 |
 | 数据合同 | `configs/data/grouped_robot_v1.yaml`、`configs/data/source_contracts_v1.yaml` |
-| 训练配置 | `configs/train/wm3d_wam_v1.yaml` |
+| 模型合同 | `configs/model/vggt_geometry_v1.yaml`、`configs/model/wan_action_mot_v1.yaml` |
+| 训练合同 | `configs/train/wm3d_wam_v1.yaml` |
 
-## 代码基线选择
+## 基线选择
 
-WM3D-WAM 是唯一集成入口，没有整体 fork 某个旧仓库。三个基线各自只负责已经
-验证过的部分：
+WM3D-WAM 使用独立仓库作为集成边界，没有把一个旧项目整体复制成主干。选择如下：
 
-| 范围 | 基线 | 本仓库采用的实现 |
+| 子系统 | 基线 | 采用内容 |
 |---|---|---|
-| 视频与动作 | FastWAM | Wan2.2 VideoDiT、ActionDiT、30 层 MoT、flow scheduler、observed-video prefill |
-| 数据与时钟 | 原 WM3D | recorded timestamp、grouped robot ABI、adapter、manifest、episode split |
-| 几何 | node 41 VGGT-GAM | VGGT pair 0–3 / 4–23 split、future predictor、deep action token |
+| 世界状态 | 原版 WM3D 3D | 多视角 token fusion、factorized state trunk、连续时间、action-free prior、factual dynamics |
+| RGB 和动作耦合 | FastWAM / Wan2.2 | VideoDiT、VAE、UMT5、ActionDiT 初始化、逐层 MoT、flow matching、prefill cache |
+| 几何 | 官方 VGGT + node 41 adapter | pairs 0–3 shallow split、pairs 4–23 deep resume、DPT heads |
+| 数据组织 | 原 WM3D + Worldscape-MoE 经验 | recorded timestamp、grouped robot ABI、显式 source contract、分层 sampler |
 
-Worldscape-MoE 用于核对多源数据组织、采样层级与 source 隔离方式。它不包含本
-项目需要的 Wan2.2 ActionDiT、grouped action ABI 和 VGGT split-and-resume，
-所以没有作为代码主干。
+原版 WM3D 最适合承担 world model core，因为它的状态先验与事实动力学就是本项目
+需要的世界状态抽象。FastWAM 最适合承担 Wan/Action 的工程基线。node 41 项目只
+提供经过实测的 VGGT 切分适配器。GAM future predictor 和 GAM action heads 已从
+active graph、optimizer、loss 和公共导出中移除。
+
+## Active 模型图
+
+```text
+raw observed RGB
+    -> frozen VGGT pairs 0-3
+    -> observed shallow tokens
+    -> WM3D action-free state prior, K=16
+         -> optional factual-action dynamics
+         -> per-view shallow decoder
+    -> trainable VGGT pairs 4-23 at four anchors
+    -> reduced geometry K/V
+    -> Wan2.2 Video Expert <-> Grouped Action Expert
+         -> RGB velocity
+         -> grouped action velocity
+```
+
+`src/wm3d_wam/models/factory.py` 只构造 `WM3DStateDynamicsCore`、
+`GroupedHistoryConnector`、`VGGTEncoder` 和 reducer。没有 GAMFuturePredictor、
+policy token 或 auxiliary action head 的构造路径。
 
 ## 数据实现
 
-`scripts/build_episode_splits.py` 为 21 个 source 物化固定 split。
-`configs/data/source_contracts_v1.yaml` 再做训练门禁：7 个 verified source 进入
-sampler，14 个 excluded source 保留统计但不能训练。当前有效划分为 527,647
-train、5,383 val、5,383 test episode。
+`scripts/build_episode_splits.py` 为 21 个 source 物化固定 split。source contract
+允许七个 verified source 进入 sampler，合计 527,647 train、5,383 val、5,383
+test episode。十四个 source 保持 excluded。
 
-在线 loader 执行以下工作：
+在线 loader 提供：
 
-- 根据 recorded timestamp 选择 16 个历史 state、4 个 VGGT history keyframe、
-  4 个未来 geometry anchor 和 9 个 Wan frame；
-- 保留实际 V=1/2/3 camera bucket，不插入伪造 view；
-- 通过 manifest PTS seek 和稀疏 row decode 读取 MP4，不解码完整 episode；
-- past action/state 以 policy anchor 为时间原点，future action 使用半开区间
-  `[0,1.6s)`；
-- 保留 5/10/15/20 Hz 原生命令及真实时间戳，不插值、不复制末值；
-- 用 `ceil(duration * source_hz) + 1` 分配 event 容量，容纳 recorded-time
-  边界抖动；
-- 不读取 VGGT、depth、point、pose 或 Wan latent 派生缓存。
+- 16 个历史 grouped state step 和全部原生历史 action event；
+- 四个 observed VGGT keyframe；
+- K=16 的 10 Hz future world grid；
+- 10 Hz 以上 source 的 17 帧 Wan clip；
+- 5 Hz source 的八个真实 target 与八个 masked slot；
+- 5/10/15/20 Hz 原生 future action event，按 16 个时间 bin 建索引；
+- 一到三个真实 camera view，不补假视角；
+- manifest PTS seek 和覆盖目标行的稀疏 MP4 decode。
 
-分层 sampler 先选 program、family 和 source，再选 episode、window 与 view。
-FSDP 要求各 rank 走相同模块路径，因此 route 和 tensor schema 按 local sample
-index 同步；具体 episode/window 仍按 rank-specific global sample index 选择。
+模型不读取 VGGT、depth、point、pose 或 Wan latent 派生缓存。
 
 ## 模型实现
 
-### Online VGGT-GAM
+`src/wm3d_wam/models/wm3d_state_dynamics.py` 包含约 875.9M 参数的生产状态核心。
+它先生成不依赖未来动作的 K=16 prior，再由独立 dynamics block 使用事实动作。
+`ViewTokenDecoder` 将融合状态恢复到 `[B,16,V,261,1024]`。
 
-- VGGT pair 0–3 在 forward 内以 `no_grad` 编码历史和 target RGB；
-- grouped history connector 使用全部 16 个 state step 与原生 past-action event；
-- 12 层 future predictor 预测 0.4/0.8/1.2/1.6 秒 shallow anchors；
-- pair 4–23 接收预测 shallow token 与 action seed，输出 deep token、depth、
-  world point 和 camera pose；
-- direct 与 refined auxiliary head 解码 grouped action；
-- clean future RGB 只进入 detached target branch。
+`src/wm3d_wam/models/online_vggt_geometry.py` 负责在线 shallow targets、VGGT deep
+resume 和 geometry reduction。所有 16 步有 shallow supervision；0.4、0.8、1.2、
+1.6 秒有额外 deep geometry supervision。future teacher 使用 chunked no-grad
+编码，clean target tensor 始终 detach。
 
-VGGT 是训练计算图中的核心主干。训练不要求先生成 VGGT cache。
+`src/wm3d_wam/models/wan_action_mot.py` 保留 30 层 Wan Video Expert 与 30 层
+Grouped Action Expert。两个 expert 每层共享 mixed attention，动作输出仍遵守
+grouped robot ABI。geometry 在五层稀疏注入。
 
-### Wan2.2 与 Grouped Action MoT
+## 训练与恢复
 
-- Wan2.2 TI2V-5B Video Expert 保留 30 层、hidden 3072、FFN 14336；
-- Grouped Action Expert 使用 30 层、hidden 1024、FFN 4096；
-- action codec 编码 value、semantic、group、composition、embodiment、event
-  timestamp 和 delta；
-- 两个 expert 每层各自产生 Q/K/V，共享一次 mixed attention，再回到各自的
-  projection 与 FFN；
-- geometry 在层 5/11/17/23/29 作为额外 K/V；
-- `action_only`、`forward_world`、`joint_world_action` 使用各自严格 mask；
-- action-only 训练与部署复用 observed-video prefill cache 路径。
+`scripts/train_wm3d_wam.py` 支持四个 phase：
 
-ActionDiT backbone 从本地 Wan2.2 权重生成：shape 相同的 tensor 直接迁移，
-shape 不同的 tensor 使用 FastWAM 的逐维线性插值与 alpha scaling；grouped
-codec 和输出层单独初始化。
+- `world_core_pretrain`；
+- `wan_action_warmup`；
+- `wan_action_main`；
+- `tri_stream_alignment`。
 
-## 训练与恢复实现
+运行时使用 BF16 forward/reduce、FP32 master weights、FSDP FULL_SHARD、activation
+checkpointing、cosine schedule、validation、编号 checkpoint 和已提交 sampler
+cursor。world-core checkpoint 使用 canonical DCP。完整模型使用 rank-local shard，
+恢复时校验有序 GPU mesh、micro-batch 和 gradient accumulation。
 
-`scripts/train_wm3d_wam.py` 是 Stage A/B/C 的正式入口，提供：
-
-- 多进程在线 Dataset/DataLoader 和可恢复分层 sampler；
-- BF16 forward/reduce、FP32 master weights、FSDP FULL_SHARD；
-- Stage-specific optimizer group、cosine schedule、gradient accumulation、
-  clipping、JSONL metrics 和周期 validation；
-- 数据读取失败的跨 rank readiness handshake；
-- Stage A canonical DTensor DCP；
-- Stage B/C rank-local model、optimizer、scheduler、RNG、cursor checkpoint；
-- exact resume、Stage A→B canonical initialization、B warmup→main→C local
-  initialization；
-- source/view-schema 一致的真实 micro-batch collate；
-- 完成标记、原子 latest 指针和显式 checkpoint retention。
-
-完整阶段的 local shard 要求相同 world size 和相同有序物理 GPU mesh。checkpoint
-元数据记录并校验该列表。Stage A canonical checkpoint 可以重分片到不同 world
-size。精确恢复同时校验 micro-batch size 与 gradient accumulation。
-
-FSDP 只在 root 与完整 `WanActionMoT` 边界切分。VGGT functional block path 和
-MoT 内部 expert 不能单独 auto-wrap，否则 forward 会在参数 gather 边界之外读取
-shard。冻结的 VGGT heads 保持 FP32 并排除出 FSDP；Wan VAE 与 UMT5 永久冻结。
+七卡 K=16 world-core 的正式安全值是 micro-batch 4、accumulation 1、global batch
+28。batch 6 曾通过一步但板卡占用接近 80GB；batch 8 OOM，因此配置不会使用它们。
 
 ## 本地资产
 
@@ -111,22 +106,12 @@ shard。冻结的 VGGT heads 保持 FP32 并排除出 FSDP；Wan VAE 与 UMT5 �
 /data/Minko/world_model/wm3d_v8_action_experiments/gam_node42_v1/runtime/vggt
 ```
 
-worker 只接受完整本地 bundle，不调用 Hub 或镜像下载。loader 已处理 Wan VAE
-normalization constant 与 Wan RoPE table 这两类 checkpoint 之外的 runtime
-constant。
+路径中的 `gam_node42_v1` 是已存在的 VGGT checkpoint/source 资产目录名，不代表
+运行时使用 GAM policy。
 
-## 当前验证结论
+## 当前边界
 
-- 60 个 CPU 合同测试通过；
-- 单卡真实数据的 Stage A、三种 interaction program、cache parity、target
-  leakage、双向梯度归因和三步短拟合通过；
-- Stage A 双卡保存并精确恢复到下一步；
-- Stage B warmup 五卡完成 forward-world、joint、action-only，且跨进程恢复；
-- Stage B main 五卡解冻 Wan/VGGT deep 并保存完整 checkpoint；
-- Stage C 五卡完成 train、validation 和 checkpoint；
-- 五卡 canary mesh `1,2,5,6,7` 的峰值显存低于 80 GiB；正式 mesh 已扩展为
-  `1,2,3,4,5,6,7`，Stage A 于 2026-08-20 启动。
-
-详细数值见 [EXPERIMENTS.md](EXPERIMENTS.md)，启动和恢复命令见
-[TRAINING.md](TRAINING.md)。代码已具备七源正式训练条件。尚未完成的是正式长训
-后的策略评测，以及 14 个 excluded source 的 payload-level 控制合同审计。
+新架构已完成 CPU contract、真实数据单卡所有 route、七卡 world-core train/
+validation/checkpoint 门禁。旧 Geometry-GAM 正式 checkpoint 与新 core 不兼容，
+不会继续 resume。完整 Wan/Action 的 K=16 七卡分布式 canary 要在进入对应阶段前
+重新执行；旧架构的 Stage B/C canary 不能替代这项门禁。

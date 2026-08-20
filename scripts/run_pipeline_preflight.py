@@ -136,7 +136,8 @@ def _policy_target_leakage(
         ),
         "state_history": window.state_history,
         "action_history": window.action_history,
-        "mode": GeometryConditionMode.POLICY,
+        "future_world_times_s": window.future_world_times_s,
+        "mode": GeometryConditionMode.ACTION_FREE,
         "language_features": context,
         "language_padding_mask": context_mask,
         "observed_view_valid_mask": system._batched_view_mask(
@@ -145,13 +146,16 @@ def _policy_target_leakage(
         "future_view_valid_mask": system._batched_view_mask(
             window.future_view_valid_mask, name="future_view_valid_mask"
         ),
+        "future_world_valid_mask": system._batched_view_mask(
+            window.future_world_valid_mask, name="future_world_valid_mask"
+        ),
         "decode_geometry_heads": False,
         "compute_target_geometry": False,
     }
     without_target = core(future_target_images=None, **kwargs)
     with_target = core(
         future_target_images=system._batched_images(
-            window.future_anchor_images, name="future_anchor_images"
+            window.future_world_images, name="future_world_images"
         ),
         **kwargs,
     )
@@ -204,7 +208,7 @@ def main() -> None:
     parser.add_argument("--backward", action="store_true")
     parser.add_argument(
         "--backward-loss",
-        choices=("total", "action", "video", "geometry", "auxiliary"),
+        choices=("total", "action", "video", "geometry"),
         default="total",
     )
     parser.add_argument("--cache-parity", action="store_true")
@@ -247,6 +251,7 @@ def main() -> None:
         episode=episode,
         source_contract=contract,
         normalization=normalization,
+        program=args.program,
     )
     result["data_seconds"] = time.perf_counter() - start
     result["data"] = {
@@ -376,7 +381,6 @@ def main() -> None:
             "action": output.action_loss,
             "video": output.video_loss,
             "geometry": output.geometry_loss,
-            "auxiliary": output.auxiliary_action_loss,
         }[args.backward_loss]
         if not selected_loss.requires_grad:
             raise ValueError(

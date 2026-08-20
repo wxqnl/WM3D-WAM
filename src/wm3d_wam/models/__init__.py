@@ -7,10 +7,6 @@ from .grouped_action_flow import (
     load_grouped_action_backbone,
 )
 from .geometry_adapters import SparseGeometryKVAdapters
-from .geometry_action_heads import (
-    GroupedAuxiliaryActionOutput,
-    GroupedGeometryActionHeads,
-)
 from .factory import (
     build_online_geometry_core,
     build_wan_action_mot,
@@ -30,13 +26,16 @@ from .online_vggt_geometry import (
 )
 from .wan_action_mot import ObservedVideoKVCache, WanActionMoT, WanActionOutput
 from .system import WM3DWAMProgramOutput, WM3DWAMSystem
+from .wm3d_state_dynamics import (
+    WM3DStateDynamicsConfig,
+    WM3DStateDynamicsCore,
+    WM3DStateDynamicsOutput,
+)
 
 __all__ = [
     "GroupedActionCodec",
     "GroupedActionCodecConfig",
     "GroupedActionFlowExpert",
-    "GroupedAuxiliaryActionOutput",
-    "GroupedGeometryActionHeads",
     "load_grouped_action_backbone",
     "GroupedHistoryConnector",
     "GroupedHistoryConnectorConfig",
@@ -52,6 +51,9 @@ __all__ = [
     "WanActionOutput",
     "WM3DWAMProgramOutput",
     "WM3DWAMSystem",
+    "WM3DStateDynamicsConfig",
+    "WM3DStateDynamicsCore",
+    "WM3DStateDynamicsOutput",
     "build_online_geometry_core",
     "build_mot_attention_mask",
     "build_wan_action_mot",

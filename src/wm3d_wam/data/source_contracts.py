@@ -27,7 +27,7 @@ from .grouped_robot import (
 
 TRAINING_PROGRAMS = frozenset(
     {
-        "geometry_pretrain",
+        "world_core_pretrain",
         "action_only",
         "forward_world",
         "joint_world_action",

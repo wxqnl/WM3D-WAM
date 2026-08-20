@@ -25,9 +25,7 @@ from .flow_matching import (
 )
 from .objectives import (
     GeometryObjectiveLoss,
-    GroupedAuxiliaryActionLoss,
     geometry_objective_loss,
-    grouped_auxiliary_action_loss,
 )
 
 
@@ -38,11 +36,9 @@ class WM3DWAMTrainingOutput:
     action_loss: torch.Tensor
     video_loss: torch.Tensor
     geometry_loss: torch.Tensor
-    auxiliary_action_loss: torch.Tensor
     action_flow: Optional[GroupedActionFlowSample]
     video_flow: Optional[VideoFlowSample]
     geometry_objective: Optional[GeometryObjectiveLoss]
-    auxiliary_action_objective: Optional[GroupedAuxiliaryActionLoss]
 
     def detached_metrics(self) -> dict[str, float]:
         metrics = {
@@ -50,14 +46,11 @@ class WM3DWAMTrainingOutput:
             "loss_action": float(self.action_loss.detach()),
             "loss_video": float(self.video_loss.detach()),
             "loss_geometry": float(self.geometry_loss.detach()),
-            "loss_auxiliary_action": float(self.auxiliary_action_loss.detach()),
         }
         if self.geometry_objective is not None:
             for name, value in self.geometry_objective.detached_metrics().items():
                 if name != "loss_total":
                     metrics[f"geometry_{name}"] = value
-        if self.auxiliary_action_objective is not None:
-            metrics.update(self.auxiliary_action_objective.detached_metrics())
         return metrics
 
 
@@ -91,6 +84,8 @@ class WM3DWAMTrainingPipeline(nn.Module):
         geometry_gradient_checkpointing: bool = False,
     ) -> WM3DWAMTrainingOutput:
         mode = InteractionProgram(program)
+        if window.program != mode.value:
+            raise ValueError("window route and requested interaction program differ")
         if clean_video_latents is None:
             clean_video_latents = self.system.encode_wan_video(window.wan_video)
         if clean_video_latents.shape[0] != window.batch_size:
@@ -181,9 +176,9 @@ class WM3DWAMTrainingPipeline(nn.Module):
         if mode is InteractionProgram.FORWARD_WORLD:
             geometry_objective = geometry_objective_loss(
                 program_output.geometry,
-                future_view_valid_mask=self.system._batched_view_mask(
-                    window.future_view_valid_mask,
-                    name="future_view_valid_mask",
+                future_world_valid_mask=self.system._batched_view_mask(
+                    window.future_world_valid_mask,
+                    name="future_world_valid_mask",
                 ),
                 feature_weight=1.0,
                 geometry_weight=0.3,
@@ -192,25 +187,15 @@ class WM3DWAMTrainingPipeline(nn.Module):
         elif mode is InteractionProgram.JOINT_WORLD_ACTION:
             geometry_objective = geometry_objective_loss(
                 program_output.geometry,
-                future_view_valid_mask=self.system._batched_view_mask(
-                    window.future_view_valid_mask,
-                    name="future_view_valid_mask",
+                future_world_valid_mask=self.system._batched_view_mask(
+                    window.future_world_valid_mask,
+                    name="future_world_valid_mask",
                 ),
                 feature_weight=0.5,
                 geometry_weight=0.0,
             )
             geometry_loss = geometry_objective.total
-        auxiliary_action_objective = None
-        auxiliary_action_loss = zero
-        if mode is InteractionProgram.ACTION_ONLY:
-            if program_output.auxiliary_actions is None:
-                raise RuntimeError("action-only program returned no auxiliary actions")
-            auxiliary_action_objective = grouped_auxiliary_action_loss(
-                program_output.auxiliary_actions,
-                clean_actions,
-            )
-            auxiliary_action_loss = 0.1 * auxiliary_action_objective.total
-        total = action_loss + video_loss + geometry_loss + auxiliary_action_loss
+        total = action_loss + video_loss + geometry_loss
         if not bool(torch.isfinite(total)):
             raise FloatingPointError("WM3D-WAM training loss is non-finite")
         return WM3DWAMTrainingOutput(
@@ -219,9 +204,7 @@ class WM3DWAMTrainingPipeline(nn.Module):
             action_loss=action_loss,
             video_loss=video_loss,
             geometry_loss=geometry_loss,
-            auxiliary_action_loss=auxiliary_action_loss,
             action_flow=action_flow,
             video_flow=video_flow,
             geometry_objective=geometry_objective,
-            auxiliary_action_objective=auxiliary_action_objective,
         )

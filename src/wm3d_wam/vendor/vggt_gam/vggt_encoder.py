@@ -1,14 +1,15 @@
-"""VGGT backbone adapter for the GAM shallow-predict-deep contract.
+"""VGGT backbone adapter for a shallow-predict-deep contract.
 
-The official VGGT aggregator is a stack of 24 frame/global block pairs.  GAM
-needs to stop the geometry model at a shallow layer, predict future shallow
-tokens and an action token, then resume the trainable deep stack.  This module
-implements that split without modifying the pinned VGGT source tree.
+The official VGGT aggregator is a stack of 24 frame/global block pairs. This
+adapter stops at a shallow layer, accepts predicted future shallow tokens, and
+resumes the trainable deep stack without modifying the pinned VGGT source.
+The adapter originated in the local VGGT-GAM prototype; WM3D-WAM does not use
+its policy predictor or insert action tokens into VGGT.
 
 Temporal policy
 ---------------
 Shallow encoding treats each timestep as an independent multi-camera VGGT
-scene, matching the GAM paper. Deep propagation supports either independent
+scene. Deep propagation supports either independent
 timesteps or cross-timestep global attention with a strict block-causal mask.
 Both modes are bit-identical to official VGGT for ``H=1``.
 """
@@ -80,12 +81,12 @@ def _ensure_local_vggt_on_path(source_root: str) -> Path:
 
 
 class VGGTEncoder(nn.Module):
-    """Expose VGGT through the Stage-1 GAM backbone API.
+    """Expose VGGT through the shallow/deep adapter API.
 
     ``split_layer`` is the first deep frame/global pair.  With the recommended
     value 4, shallow encoding runs pairs 0--3 and deep propagation runs 4--23.
-    VGGT's four DPT taps (4, 11, 17, 23) therefore all remain downstream of the
-    predicted action token.
+    VGGT's four DPT taps (4, 11, 17, 23) therefore remain downstream of the
+    WM3D-predicted shallow world tokens.
     """
 
     PATCH_SIZE = 14
@@ -126,7 +127,7 @@ class VGGTEncoder(nn.Module):
         if use_temporal_embed:
             raise ValueError(
                 "VGGTEncoder does not add a second temporal embedding. "
-                "Temporal information is modeled by GAMFuturePredictor."
+                "Physical time is modeled by WM3DStateDynamicsCore."
             )
         if action_only_frame_attn:
             raise ValueError("action_only_frame_attn is DA3-specific and unsupported by VGGTEncoder.")
@@ -1010,6 +1011,32 @@ class VGGTEncoder(nn.Module):
         return self._propagate_impl(
             visual_tokens,
             action_tokens,
+            decode_visuals=decode_visuals,
+            dpt_chunk_size=dpt_chunk_size,
+            gradient_checkpointing=gradient_checkpointing,
+            return_multi_level=return_multi_level,
+            step_valid_mask=step_valid_mask,
+            deep_temporal_causal_mask=deep_temporal_causal_mask,
+            profile=profile,
+        )
+
+    def propagate_shallow_without_actions_grad(
+        self,
+        visual_tokens: torch.Tensor,
+        *,
+        decode_visuals: bool = True,
+        dpt_chunk_size: int = 1,
+        gradient_checkpointing: bool = False,
+        return_multi_level: bool = False,
+        step_valid_mask: Optional[torch.Tensor] = None,
+        deep_temporal_causal_mask: bool = False,
+        profile: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Resume trainable deep VGGT without inserting a policy-action token."""
+
+        return self._propagate_impl(
+            visual_tokens,
+            None,
             decode_visuals=decode_visuals,
             dpt_chunk_size=dpt_chunk_size,
             gradient_checkpointing=gradient_checkpointing,

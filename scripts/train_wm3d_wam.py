@@ -12,12 +12,25 @@ from pathlib import Path
 # Expandable segments prevent those variable-size collectives from stranding
 # enough reserved address space to block the reduced FP32 gradient shard.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# Root filesystem space is intentionally tight on New-H100-2. Keep generated
+# Inductor/Triton artifacts with the project outputs on /data, not under /tmp
+# or /root. The variables must be set before importing the model stack.
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_COMPILER_CACHE_ROOT = _PROJECT_ROOT / "outputs" / "runtime_cache"
+os.environ.setdefault(
+    "TORCHINDUCTOR_CACHE_DIR",
+    str(_COMPILER_CACHE_ROOT / "torchinductor"),
+)
+os.environ.setdefault(
+    "TRITON_CACHE_DIR",
+    str(_COMPILER_CACHE_ROOT / "triton"),
+)
 
-from wm3d_wam.training.distributed import (
+from wm3d_wam.training.distributed import (  # noqa: E402
     initialize_distributed,
     shutdown_distributed,
 )
-from wm3d_wam.training.trainer import (
+from wm3d_wam.training.trainer import (  # noqa: E402
     PHASES,
     TrainerOptions,
     TrainingPaths,

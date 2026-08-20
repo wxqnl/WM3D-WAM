@@ -13,7 +13,7 @@ from wm3d_wam.models.online_vggt_geometry import OnlineVGGTGeometryCore
 
 
 class TrainingStage(str, Enum):
-    GEOMETRY_GAM = "geometry_gam"
+    WORLD_CORE_PRETRAIN = "world_core_pretrain"
     WAN_ACTION_WARMUP = "wan_action_warmup"
     WAN_ACTION_MAIN = "wan_action_main"
     TRI_STREAM_ALIGNMENT = "tri_stream_alignment"
@@ -35,33 +35,26 @@ def _unique_parameters(values: Iterable[torch.nn.Parameter]) -> list[torch.nn.Pa
     return output
 
 
-def _geometry_predictor_parameters(
+def _world_core_parameters(
     geometry: OnlineVGGTGeometryCore,
 ) -> list[torch.nn.Parameter]:
     return _unique_parameters(
-        list(geometry.future_predictor.parameters())
+        list(geometry.state_dynamics.parameters())
         + list(geometry.history_connector.parameters())
-        + list(geometry.mode_embedding.parameters())
-        + [geometry.terminal_action_seed]
         + list(geometry.geometry_reducer.parameters())
-        + (
-            list(geometry.auxiliary_action_heads.parameters())
-            if geometry.auxiliary_action_heads is not None
-            else []
-        )
     )
 
 
-def configure_geometry_pretraining_parameter_groups(
+def configure_world_core_pretraining_parameter_groups(
     geometry: OnlineVGGTGeometryCore,
     *,
     weight_decay: float = 0.01,
 ) -> list[dict[str, object]]:
-    """Stage-A groups: predictor/connector/aux heads plus VGGT deep pairs."""
+    """Stage-A groups: WM3D state dynamics plus VGGT deep pairs."""
 
     geometry.requires_grad_(False)
-    predictor_parameters = _geometry_predictor_parameters(geometry)
-    for parameter in predictor_parameters:
+    world_core_parameters = _world_core_parameters(geometry)
+    for parameter in world_core_parameters:
         parameter.requires_grad = True
     encoder = geometry.encoder
     encoder.freeze_blocks_before(encoder.split_layer)
@@ -78,8 +71,8 @@ def configure_geometry_pretraining_parameter_groups(
     )
     groups = [
         {
-            "name": "geometry_predictor",
-            "params": predictor_parameters,
+            "name": "wm3d_state_dynamics",
+            "params": world_core_parameters,
             "lr": 1.0e-5,
             "weight_decay": float(weight_decay),
         },
@@ -110,12 +103,12 @@ def configure_stage_parameter_groups(
     geometry = system.geometry_core
     encoder = geometry.encoder
 
-    predictor_parameters = _geometry_predictor_parameters(geometry)
-    for parameter in predictor_parameters:
+    world_core_parameters = _world_core_parameters(geometry)
+    for parameter in world_core_parameters:
         parameter.requires_grad = True
 
     enable_deep = stage in {
-        TrainingStage.GEOMETRY_GAM,
+        TrainingStage.WORLD_CORE_PRETRAIN,
         TrainingStage.WAN_ACTION_MAIN,
         TrainingStage.TRI_STREAM_ALIGNMENT,
     }
@@ -141,15 +134,19 @@ def configure_stage_parameter_groups(
                 }
             )
 
-    predictor_lr = {
-        TrainingStage.GEOMETRY_GAM: 1.0e-5,
+    world_core_lr = {
+        TrainingStage.WORLD_CORE_PRETRAIN: 1.0e-5,
         TrainingStage.WAN_ACTION_WARMUP: 1.0e-5,
         TrainingStage.WAN_ACTION_MAIN: 1.0e-5,
         TrainingStage.TRI_STREAM_ALIGNMENT: 5.0e-6,
     }[stage]
-    append_group("geometry_predictor", predictor_parameters, predictor_lr)
+    append_group("wm3d_state_dynamics", world_core_parameters, world_core_lr)
     if enable_deep:
-        deep_lr = 1.0e-5 if stage is TrainingStage.GEOMETRY_GAM else 5.0e-6
+        deep_lr = (
+            1.0e-5
+            if stage is TrainingStage.WORLD_CORE_PRETRAIN
+            else 5.0e-6
+        )
         append_group(
             "vggt_deep",
             (
@@ -164,7 +161,7 @@ def configure_stage_parameter_groups(
             deep_lr,
         )
 
-    if stage is not TrainingStage.GEOMETRY_GAM:
+    if stage is not TrainingStage.WORLD_CORE_PRETRAIN:
         _set_trainable(system.wan_action.action_expert, True)
         append_group(
             "action_expert",

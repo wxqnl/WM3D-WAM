@@ -35,7 +35,6 @@ from wm3d_wam.models.factory import (
 from wm3d_wam.models.system import WM3DWAMSystem
 
 from .checkpointing import (
-    CheckpointError,
     LOCAL_FSDP_SCHEMA,
     load_checkpoint,
     load_model_only,
@@ -48,13 +47,12 @@ from .distributed import (
     distributed_barrier,
     reduce_metrics,
     seed_everything,
-    unwrap_module,
     wrap_full_shard,
 )
-from .geometry_pipeline import GeometryPretrainingPipeline
+from .geometry_pipeline import WorldCorePretrainingPipeline
 from .parameter_groups import (
     TrainingStage,
-    configure_geometry_pretraining_parameter_groups,
+    configure_world_core_pretraining_parameter_groups,
     configure_stage_parameter_groups,
 )
 from .pipeline import WM3DWAMTrainingPipeline
@@ -257,7 +255,7 @@ def build_training_model(
 ) -> BuiltTrainingModel:
     model_config = load_yaml_mapping(paths.model_config)
     geometry_config = load_yaml_mapping(paths.geometry_config)
-    if phase == TrainingStage.GEOMETRY_GAM.value:
+    if phase == TrainingStage.WORLD_CORE_PRETRAIN.value:
         text = load_local_wan_components(
             asset_root=paths.wan_assets,
             dit_config={},
@@ -277,7 +275,7 @@ def build_training_model(
             dtype=dtype,
         )
         return BuiltTrainingModel(
-            pipeline=GeometryPretrainingPipeline(geometry),
+            pipeline=WorldCorePretrainingPipeline(geometry),
             text_components=text,
             is_geometry_only=True,
         )
@@ -331,8 +329,8 @@ def build_training_model(
 
 
 def _program_mix(phase: str) -> dict[str, float]:
-    if phase == TrainingStage.GEOMETRY_GAM.value:
-        return {"geometry_pretrain": 1.0}
+    if phase == TrainingStage.WORLD_CORE_PRETRAIN.value:
+        return {"world_core_pretrain": 1.0}
     if phase in {
         TrainingStage.WAN_ACTION_WARMUP.value,
         TrainingStage.WAN_ACTION_MAIN.value,
@@ -352,8 +350,10 @@ def _program_mix(phase: str) -> dict[str, float]:
 def _configure_groups(model: BuiltTrainingModel, phase: str) -> list[dict[str, object]]:
     if model.is_geometry_only:
         pipeline = model.pipeline
-        assert isinstance(pipeline, GeometryPretrainingPipeline)
-        return configure_geometry_pretraining_parameter_groups(pipeline.geometry_core)
+        assert isinstance(pipeline, WorldCorePretrainingPipeline)
+        return configure_world_core_pretraining_parameter_groups(
+            pipeline.geometry_core
+        )
     pipeline = model.pipeline
     assert isinstance(pipeline, WM3DWAMTrainingPipeline)
     return configure_stage_parameter_groups(pipeline.system, TrainingStage(phase))
@@ -431,13 +431,15 @@ def _initialize_cross_phase(
     source = resolve_checkpoint(checkpoint)
     metadata = json.loads((source / "metadata.json").read_text(encoding="utf-8"))
     source_phase = str(metadata.get("phase", ""))
-    source_geometry_only = source_phase == TrainingStage.GEOMETRY_GAM.value
+    source_geometry_only = (
+        source_phase == TrainingStage.WORLD_CORE_PRETRAIN.value
+    )
     if current_geometry_only and not source_geometry_only:
         raise TrainerError("a full Wan/Action checkpoint cannot initialize Stage A")
     if source_geometry_only and not current_geometry_only:
         if not isinstance(pipeline, WM3DWAMTrainingPipeline):
             raise TrainerError("full pipeline type is inconsistent")
-        geometry_view = GeometryPretrainingPipeline(pipeline.system.geometry_core)
+        geometry_view = WorldCorePretrainingPipeline(pipeline.system.geometry_core)
         load_model_only(
             path_or_root=source,
             model=geometry_view,
@@ -464,7 +466,7 @@ def _forward_sample(
     window = sample.window.to(device=device, dtype=dtype)
     context, context_mask = prompt_cache.encode_batch(sample.task_texts)
     with torch.autocast(device_type="cuda", dtype=dtype):
-        if sample.request.program == "geometry_pretrain":
+        if sample.request.program == "world_core_pretrain":
             output = model(
                 window=window,
                 context=context,
@@ -663,7 +665,7 @@ def train(
         for group in groups
     }
     if built.is_geometry_only:
-        assert isinstance(built.pipeline, GeometryPretrainingPipeline)
+        assert isinstance(built.pipeline, WorldCorePretrainingPipeline)
         geometry_core = built.pipeline.geometry_core
     else:
         assert isinstance(built.pipeline, WM3DWAMTrainingPipeline)

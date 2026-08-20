@@ -134,7 +134,7 @@ def _uses_local_fsdp_checkpoint(phase: str) -> bool:
     # Wan/Action phases keep the same model and device mesh, so an exact local
     # flat-shard checkpoint avoids FSDP1's prohibitively expensive canonical
     # optimizer-state reconstruction for the 11B-parameter MoT.
-    return str(phase) != "geometry_gam"
+    return str(phase) != "world_core_pretrain"
 
 
 def _capture_rng() -> dict[str, object]:

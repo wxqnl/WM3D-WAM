@@ -23,8 +23,13 @@ def test_production_model_config_preserves_fastwam_scale_and_geometry_layers() -
 def test_data_config_keeps_renderer_and_action_clocks_separate() -> None:
     config = OmegaConf.load(ROOT / "configs/data/grouped_robot_v1.yaml")
 
-    assert config.window.renderer_hz == 5
-    assert config.window.video_frames == 9
+    assert config.window.world_hz == 10
+    assert config.window.future_steps == 16
+    assert config.window.video_frames == 17
+    assert list(config.window.vggt_geometry_anchor_indices) == [3, 7, 11, 15]
+    assert list(config.window.five_hz_world_valid_indices) == [
+        1, 3, 5, 7, 9, 11, 13, 15
+    ]
     assert config.action.preserve_source_native_clock
     assert OmegaConf.to_container(config.action.events_per_window) == {
         5: 8,
@@ -49,11 +54,15 @@ def test_runtime_forbids_gpu_zero_and_geometry_bridge_is_a_hard_gate() -> None:
     assert list(runtime.runtime.permitted_cuda_devices) == [1, 2, 3, 4, 5, 6, 7]
     assert list(runtime.runtime.visible_cuda_devices) == [1, 2, 3, 4, 5, 6, 7]
     assert list(runtime.runtime.forbidden_cuda_devices) == [0]
+    assert runtime.runtime.compiler_cache_root == "outputs/runtime_cache"
     assert runtime.runtime.micro_batch_per_gpu == 4
     assert runtime.runtime.gradient_accumulation_steps == 1
     assert runtime.runtime.effective_global_batch == 28
-    assert (
-        geometry.future_predictor.integration_status
-        == "grouped_history_bridge_implemented"
-    )
+    assert runtime.stages.world_core_pretrain.k16_memory_canary == "passed"
+    assert runtime.stages.world_core_pretrain.rejected_micro_batch_per_gpu == 8
+    assert geometry.future_steps == 16
+    assert list(geometry.geometry_anchor_indices) == [3, 7, 11, 15]
+    assert geometry.state_dynamics.state_hidden == 1600
+    assert geometry.state_dynamics.state_layers == 18
+    assert not hasattr(geometry, "future_predictor")
     assert geometry.history_connector._target_ == "wm3d_wam.models.GroupedHistoryConnector"

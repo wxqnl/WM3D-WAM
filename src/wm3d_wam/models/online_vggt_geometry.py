@@ -1,4 +1,4 @@
-"""Online VGGT split-and-resume geometry core for WM3D-WAM."""
+"""Online VGGT split-and-resume around the WM3D state-dynamics core."""
 
 from __future__ import annotations
 
@@ -10,23 +10,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from wm3d_wam.data.action_events import GroupedActionBatch
 from wm3d_wam.data.grouped_history import (
     GroupedActionTimelineBatch,
     GroupedStateHistoryBatch,
 )
-from wm3d_wam.vendor.vggt_gam.future_predictor import GAMFuturePredictor
 from wm3d_wam.vendor.vggt_gam.vggt_encoder import VGGTEncoder
 
 from .grouped_history import GroupedHistoryConnector
-from .geometry_action_heads import (
-    GroupedAuxiliaryActionOutput,
-    GroupedGeometryActionHeads,
-)
+from .wm3d_state_dynamics import WM3DStateDynamicsCore
 
 
 class GeometryConditionMode(str, Enum):
-    POLICY = "policy"
+    ACTION_FREE = "action_free"
     FACTUAL = "factual"
 
 
@@ -35,11 +30,14 @@ class OnlineGeometryOutput:
     mode: GeometryConditionMode
     observed_shallow_tokens: torch.Tensor
     predicted_future_shallow_tokens: torch.Tensor
-    predicted_action_seed_tokens: torch.Tensor
-    predicted_future_proprio_tokens: torch.Tensor
+    action_free_future_shallow_tokens: torch.Tensor
+    action_free_native_state: torch.Tensor
+    native_state: torch.Tensor
     deep_visual_tokens: torch.Tensor
     geometry_tokens: torch.Tensor
     geometry_token_mask: torch.Tensor
+    geometry_anchor_indices: tuple[int, ...]
+    geometry_anchor_valid_mask: torch.Tensor
     student_geometry: dict[str, torch.Tensor]
     target_future_shallow_tokens: Optional[torch.Tensor]
     target_geometry: Optional[dict[str, torch.Tensor]]
@@ -74,66 +72,71 @@ class GeometryTokenReducer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if tokens.ndim != 5:
             raise ValueError("deep VGGT tokens must be [B,T,V,N,D]")
-        b, t, v, n, d = tokens.shape
+        batch, steps, views, token_count, token_dim = tokens.shape
         expected = self.num_special + self.source_patch_grid**2
-        if n != expected or d != self.token_dim:
+        if token_count != expected or token_dim != self.token_dim:
             raise ValueError(
-                f"unexpected deep token layout N/D={n}/{d}, expected {expected}/{self.token_dim}"
+                f"unexpected deep token layout N/D={token_count}/{token_dim}, "
+                f"expected {expected}/{self.token_dim}"
             )
         valid = view_valid_mask.to(device=tokens.device, dtype=torch.bool)
-        if valid.shape != (b, t, v):
+        if valid.shape != (batch, steps, views):
             raise ValueError("view_valid_mask does not align with deep tokens")
         special = tokens[:, :, :, : self.num_special]
         patches = tokens[:, :, :, self.num_special :].reshape(
-            b * t * v,
+            batch * steps * views,
             self.source_patch_grid,
             self.source_patch_grid,
-            d,
+            token_dim,
         )
         patches = patches.permute(0, 3, 1, 2)
         patches = F.adaptive_avg_pool2d(
             patches.float(), (self.output_patch_grid, self.output_patch_grid)
         ).to(dtype=tokens.dtype)
         patches = patches.permute(0, 2, 3, 1).reshape(
-            b, t, v, self.output_patch_grid**2, d
+            batch, steps, views, self.output_patch_grid**2, token_dim
         )
-        reduced = self.norm(torch.cat([special, patches], dim=3))
+        reduced = self.norm(torch.cat((special, patches), dim=3))
         reduced = reduced * valid[:, :, :, None, None].to(dtype=reduced.dtype)
         mask = valid[:, :, :, None].expand(
-            b, t, v, self.tokens_per_view
+            batch, steps, views, self.tokens_per_view
         )
-        return reduced.reshape(b, -1, d), mask.reshape(b, -1)
+        return reduced.reshape(batch, -1, token_dim), mask.reshape(batch, -1)
 
 
 class OnlineVGGTGeometryCore(nn.Module):
-    """Run shallow VGGT, causal geometry rollout, and deep VGGT online.
+    """Encode observations, roll out K=16 WM3D states, then resume VGGT.
 
-    Clean future RGB is accepted only as an optional target branch.  It is
-    encoded under ``no_grad`` and never enters the student predictor/deep path.
+    The student path never reads clean future RGB. Frozen shallow VGGT creates
+    online feature targets only when the active training program asks for
+    them. Deep VGGT runs at sparse geometry anchors while the WM3D state prior
+    itself remains dense at 10 Hz.
     """
 
     def __init__(
         self,
         *,
         encoder: VGGTEncoder,
-        future_predictor: GAMFuturePredictor,
+        state_dynamics: WM3DStateDynamicsCore,
         history_connector: GroupedHistoryConnector,
-        auxiliary_action_heads: GroupedGeometryActionHeads | None = None,
         observed_keyframe_indices: tuple[int, ...] = (0, 5, 10, 15),
-        future_anchor_count: int = 4,
+        future_steps: int = 16,
+        geometry_anchor_indices: tuple[int, ...] = (3, 7, 11, 15),
         geometry_output_patch_grid: int = 4,
+        shallow_scene_chunk_size: int = 8,
     ) -> None:
         super().__init__()
         self.encoder = encoder
-        self.future_predictor = future_predictor
+        self.state_dynamics = state_dynamics
         self.history_connector = history_connector
-        self.auxiliary_action_heads = auxiliary_action_heads
         self.observed_keyframe_indices = tuple(
             int(value) for value in observed_keyframe_indices
         )
-        self.future_anchor_count = int(future_anchor_count)
-        if self.future_anchor_count <= 0:
-            raise ValueError("future_anchor_count must be positive")
+        self.future_steps = int(future_steps)
+        self.geometry_anchor_indices = tuple(
+            int(value) for value in geometry_anchor_indices
+        )
+        self.shallow_scene_chunk_size = int(shallow_scene_chunk_size)
         if len(self.observed_keyframe_indices) < 1 or any(
             right <= left
             for left, right in zip(
@@ -142,18 +145,29 @@ class OnlineVGGTGeometryCore(nn.Module):
             )
         ):
             raise ValueError("observed keyframe indices must be strictly increasing")
-        if future_predictor.d_da3 != encoder.embed_dim:
-            raise ValueError("GAM predictor and VGGT token dimensions do not match")
-        if future_predictor.d_model != history_connector.config.d_model:
-            raise ValueError("history connector and GAM predictor widths do not match")
-        if future_predictor.num_patches_per_view != encoder.num_patches:
-            raise ValueError("GAM predictor and VGGT patch counts do not match")
-        if future_predictor.num_register_tokens != encoder.num_register_tokens:
-            raise ValueError("GAM predictor and VGGT register counts do not match")
-        self.mode_embedding = nn.Embedding(2, future_predictor.d_model)
-        self.terminal_action_seed = nn.Parameter(torch.zeros(encoder.embed_dim))
-        nn.init.normal_(self.mode_embedding.weight, std=0.02)
-        nn.init.normal_(self.terminal_action_seed, std=0.02)
+        if self.future_steps <= 0:
+            raise ValueError("future_steps must be positive")
+        if self.shallow_scene_chunk_size <= 0:
+            raise ValueError("shallow_scene_chunk_size must be positive")
+        if not self.geometry_anchor_indices or any(
+            index < 0 or index >= self.future_steps
+            for index in self.geometry_anchor_indices
+        ):
+            raise ValueError("geometry anchors must refer to the K-step future")
+        if tuple(sorted(set(self.geometry_anchor_indices))) != self.geometry_anchor_indices:
+            raise ValueError("geometry anchor indices must be unique and increasing")
+        state_config = state_dynamics.config
+        expected_token_count = 1 + encoder.num_register_tokens + encoder.num_patches
+        if state_config.observed_steps != len(self.observed_keyframe_indices):
+            raise ValueError("WM3D observed-step count does not match keyframes")
+        if state_config.future_steps != self.future_steps:
+            raise ValueError("WM3D K does not match the online geometry horizon")
+        if state_config.token_count != expected_token_count:
+            raise ValueError("WM3D and VGGT token counts do not match")
+        if state_config.token_dim != encoder.embed_dim:
+            raise ValueError("WM3D and VGGT token dimensions do not match")
+        if state_config.history_dim != history_connector.config.d_model:
+            raise ValueError("WM3D and grouped-history widths do not match")
         self.geometry_reducer = GeometryTokenReducer(
             token_dim=encoder.embed_dim,
             num_register_tokens=encoder.num_register_tokens,
@@ -161,111 +175,50 @@ class OnlineVGGTGeometryCore(nn.Module):
             output_patch_grid=geometry_output_patch_grid,
         )
 
-    def predict_auxiliary_actions(
-        self,
-        output: OnlineGeometryOutput,
-        *,
-        action_template: GroupedActionBatch,
-        future_view_valid_mask: torch.Tensor,
-    ) -> GroupedAuxiliaryActionOutput:
-        if self.auxiliary_action_heads is None:
-            raise RuntimeError("grouped geometry auxiliary action heads are not configured")
-        refined = output.student_geometry.get("action_tokens")
-        if refined is None:
-            raise RuntimeError("deep VGGT output is missing refined action tokens")
-        return self.auxiliary_action_heads(
-            predicted_action_seed_tokens=output.predicted_action_seed_tokens,
-            refined_action_tokens=refined,
-            total_steps=int(output.deep_visual_tokens.shape[1]),
-            future_view_valid_mask=future_view_valid_mask,
-            action_template=action_template,
-        )
+    @property
+    def geometry_anchor_count(self) -> int:
+        return len(self.geometry_anchor_indices)
 
     @staticmethod
     def _validate_images(name: str, images: torch.Tensor) -> tuple[int, int, int]:
         if images.ndim != 6 or images.shape[3] != 3:
             raise ValueError(f"{name} must be [B,T,V,3,H,W]")
-        if not torch.is_floating_point(images) or not bool(torch.isfinite(images).all()):
+        if not torch.is_floating_point(images) or not bool(
+            torch.isfinite(images).all()
+        ):
             raise ValueError(f"{name} must contain finite floating-point RGB")
         return int(images.shape[0]), int(images.shape[1]), int(images.shape[2])
 
     def _encode_shallow(self, images: torch.Tensor) -> torch.Tensor:
-        b, t, v = images.shape[:3]
-        flattened = images.reshape(b, t * v, *images.shape[3:])
-        # The encoder method is itself no-grad; keep this explicit at the
-        # integration boundary so shallow activations can never leak into the
-        # trainable graph.
+        batch, steps, views = images.shape[:3]
+        scenes = images.reshape(batch * steps, views, *images.shape[3:])
+        encoded: list[torch.Tensor] = []
         with torch.no_grad():
-            result = self.encoder.encode_shallow_visual_slots(flattened, T=t, V=v)
-        return result["visual_tokens"].detach()
-
-    def _predict_future(
-        self,
-        *,
-        observed_shallow: torch.Tensor,
-        proprio_tokens: torch.Tensor,
-        action_history_tokens: torch.Tensor,
-        mode: GeometryConditionMode,
-        future_action_tokens: Optional[torch.Tensor],
-        language_features: Optional[torch.Tensor],
-        language_padding_mask: Optional[torch.Tensor],
-        view_valid_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        mode_index = 0 if mode is GeometryConditionMode.POLICY else 1
-        mode_token = self.mode_embedding.weight[mode_index].to(
-            device=observed_shallow.device, dtype=observed_shallow.dtype
-        )
-        proprio_stream = proprio_tokens.to(dtype=observed_shallow.dtype) + mode_token
-        action_stream = action_history_tokens.to(dtype=observed_shallow.dtype) + mode_token
-        visual_stream = observed_shallow
-        view_stream = view_valid_mask
-        predicted_visual: list[torch.Tensor] = []
-        predicted_seed: list[torch.Tensor] = []
-        predicted_proprio: list[torch.Tensor] = []
-        last_output: dict[str, torch.Tensor] | None = None
-
-        for anchor_index in range(self.future_anchor_count):
-            conditioned_action = action_stream
-            if future_action_tokens is not None:
-                conditioned_action = action_stream.clone()
-                conditioned_action[:, -1] = (
-                    conditioned_action[:, -1]
-                    + future_action_tokens[:, anchor_index].to(
-                        dtype=conditioned_action.dtype
-                    )
+            for start in range(0, batch * steps, self.shallow_scene_chunk_size):
+                chunk = scenes[start : start + self.shallow_scene_chunk_size]
+                result = self.encoder.encode_shallow_visual_slots(
+                    chunk, T=1, V=views
                 )
-            last_output = self.future_predictor(
-                past_visual_tokens=visual_stream,
-                proprio_token_embeddings=proprio_stream,
-                past_action_token_embeddings=conditioned_action,
-                lang_feats=language_features,
-                lang_padding_mask=language_padding_mask,
-                view_valid_mask=view_stream,
-            )
-            next_visual = last_output["predicted_next_visual_tokens"][:, -1:]
-            next_seed = last_output["predicted_action_tokens"][:, -1:]
-            next_proprio = last_output["predicted_next_proprio_tokens"][:, -1:]
-            next_action_history = last_output[
-                "predicted_next_action_history_tokens"
-            ][:, -1:]
-            if future_action_tokens is not None:
-                next_action_history = future_action_tokens[:, anchor_index : anchor_index + 1]
-            predicted_visual.append(next_visual)
-            predicted_seed.append(next_seed)
-            predicted_proprio.append(next_proprio)
-            visual_stream = torch.cat([visual_stream, next_visual], dim=1)
-            proprio_stream = torch.cat([proprio_stream, next_proprio], dim=1)
-            action_stream = torch.cat([action_stream, next_action_history], dim=1)
-            view_stream = torch.cat([view_stream, view_stream[:, -1:]], dim=1)
+                encoded.append(result["visual_tokens"][:, 0])
+        visual = torch.cat(encoded, dim=0)
+        return visual.reshape(batch, steps, views, *visual.shape[-2:]).detach()
 
-        if last_output is None:
-            raise RuntimeError("future rollout produced no anchors")
-        return (
-            torch.cat(predicted_visual, dim=1),
-            torch.cat(predicted_seed, dim=1),
-            torch.cat(predicted_proprio, dim=1),
-            last_output,
+    @staticmethod
+    def _action_step_valid(timeline: GroupedActionTimelineBatch) -> torch.Tensor:
+        batch = timeline.events.event_mask.shape[0]
+        output = torch.zeros(
+            (batch, timeline.num_steps),
+            dtype=torch.bool,
+            device=timeline.step_indices.device,
         )
+        valid_event = timeline.events.event_mask.to(
+            device=timeline.step_indices.device, dtype=torch.bool
+        )
+        for step in range(timeline.num_steps):
+            output[:, step] = (
+                valid_event & timeline.step_indices.eq(step)
+            ).any(dim=1)
+        return output & timeline.step_mask.bool()
 
     def forward(
         self,
@@ -273,6 +226,7 @@ class OnlineVGGTGeometryCore(nn.Module):
         observed_images: torch.Tensor,
         state_history: GroupedStateHistoryBatch,
         action_history: GroupedActionTimelineBatch,
+        future_world_times_s: torch.Tensor,
         mode: GeometryConditionMode | str,
         future_action_history: Optional[GroupedActionTimelineBatch] = None,
         future_target_images: Optional[torch.Tensor] = None,
@@ -280,23 +234,24 @@ class OnlineVGGTGeometryCore(nn.Module):
         language_padding_mask: Optional[torch.Tensor] = None,
         observed_view_valid_mask: Optional[torch.Tensor] = None,
         future_view_valid_mask: Optional[torch.Tensor] = None,
+        future_world_valid_mask: Optional[torch.Tensor] = None,
         decode_geometry_heads: bool = True,
         compute_target_geometry: bool = False,
         gradient_checkpointing: bool = False,
     ) -> OnlineGeometryOutput:
         mode = GeometryConditionMode(mode)
-        if mode is GeometryConditionMode.POLICY and future_action_history is not None:
-            raise ValueError("policy geometry must not receive future factual actions")
+        if mode is GeometryConditionMode.ACTION_FREE and future_action_history is not None:
+            raise ValueError("action-free geometry must not receive future actions")
         if mode is GeometryConditionMode.FACTUAL and future_action_history is None:
-            raise ValueError("factual geometry requires a candidate future action timeline")
+            raise ValueError("factual geometry requires future action events")
+        if language_features is None:
+            raise ValueError("WM3D state dynamics requires language features")
 
-        b, observed_steps, views = self._validate_images(
+        batch, observed_steps, views = self._validate_images(
             "observed_images", observed_images
         )
         if observed_steps != len(self.observed_keyframe_indices):
             raise ValueError("observed image count must match configured keyframes")
-        if not 1 <= views <= 3:
-            raise ValueError("WM3D-WAM supports one to three real views per sample")
         if observed_images.shape[-2:] != (
             self.encoder.encoder_input_size,
             self.encoder.encoder_input_size,
@@ -304,7 +259,7 @@ class OnlineVGGTGeometryCore(nn.Module):
             raise ValueError("observed images are not at the VGGT input size")
         if observed_view_valid_mask is None:
             observed_view_valid_mask = torch.ones(
-                (b, observed_steps, views),
+                (batch, observed_steps, views),
                 device=observed_images.device,
                 dtype=torch.bool,
             )
@@ -312,115 +267,134 @@ class OnlineVGGTGeometryCore(nn.Module):
             observed_view_valid_mask = observed_view_valid_mask.to(
                 device=observed_images.device, dtype=torch.bool
             )
-            if observed_view_valid_mask.shape != (b, observed_steps, views):
-                raise ValueError("observed_view_valid_mask shape mismatch")
+        if observed_view_valid_mask.shape != (batch, observed_steps, views):
+            raise ValueError("observed_view_valid_mask shape mismatch")
         if not bool(observed_view_valid_mask.any(dim=2).all()):
             raise ValueError("every observed timestep needs a real camera view")
-        if not bool(observed_view_valid_mask.all()):
-            raise ValueError(
-                "padded camera views are not allowed in the VGGT deep path; "
-                "bucket windows by their exact real view count"
+
+        if future_view_valid_mask is None:
+            future_view_valid_mask = observed_view_valid_mask[:, -1:].expand(
+                batch, self.future_steps, views
             )
+        else:
+            future_view_valid_mask = future_view_valid_mask.to(
+                device=observed_images.device, dtype=torch.bool
+            )
+        if future_view_valid_mask.shape != (batch, self.future_steps, views):
+            raise ValueError("future_view_valid_mask must be [B,K,V]")
+        if not bool(future_view_valid_mask.any(dim=2).all()):
+            raise ValueError("every predicted future step needs a real view slot")
+        if future_world_valid_mask is None:
+            future_world_valid_mask = future_view_valid_mask
+        else:
+            future_world_valid_mask = future_world_valid_mask.to(
+                device=observed_images.device, dtype=torch.bool
+            )
+        if future_world_valid_mask.shape != (batch, self.future_steps, views):
+            raise ValueError("future_world_valid_mask must be [B,K,V]")
+        if bool((future_world_valid_mask & ~future_view_valid_mask).any()):
+            raise ValueError("RGB supervision cannot mark a padded view as valid")
 
         keyframes = torch.tensor(
             self.observed_keyframe_indices,
             device=state_history.values.device,
             dtype=torch.long,
         )
-        proprio_tokens, action_tokens = self.history_connector(
+        state_tokens, history_action_tokens = self.history_connector(
             state_history=state_history,
             action_history=action_history,
             keyframe_indices=keyframes,
         )
-        future_action_tokens = None
+        factual_tokens = None
+        factual_mask = None
         if future_action_history is not None:
-            if future_action_history.num_steps != self.future_anchor_count:
-                raise ValueError("future action bins must match future anchors")
-            future_action_tokens = self.history_connector.encode_action_steps(
+            if future_action_history.num_steps != self.future_steps:
+                raise ValueError("future action timeline must contain K bins")
+            factual_tokens = self.history_connector.encode_action_steps(
                 future_action_history
             )
+            factual_mask = self._action_step_valid(future_action_history)
+
+        future_world_times_s = future_world_times_s.to(
+            device=state_history.times_s.device,
+            dtype=state_history.times_s.dtype,
+        )
+        if future_world_times_s.ndim == 1:
+            future_world_times_s = future_world_times_s.unsqueeze(0)
+        if future_world_times_s.shape != (batch, self.future_steps):
+            raise ValueError("future_world_times_s must be [B,K]")
+        observed_times = state_history.times_s.index_select(1, keyframes)
+        world_times = torch.cat((observed_times, future_world_times_s), dim=1)
 
         observed_shallow = self._encode_shallow(observed_images)
-        predicted_shallow, predicted_seed, predicted_proprio, final_predictor = (
-            self._predict_future(
-                observed_shallow=observed_shallow,
-                proprio_tokens=proprio_tokens,
-                action_history_tokens=action_tokens,
-                mode=mode,
-                future_action_tokens=future_action_tokens,
-                language_features=language_features,
-                language_padding_mask=language_padding_mask,
-                view_valid_mask=observed_view_valid_mask,
-            )
+        state_output = self.state_dynamics(
+            observed_tokens=observed_shallow,
+            observed_view_mask=observed_view_valid_mask,
+            world_times_s=world_times,
+            history_state_tokens=state_tokens,
+            history_action_tokens=history_action_tokens,
+            language_context=language_features,
+            language_mask=language_padding_mask,
+            factual_action_tokens=factual_tokens,
+            factual_action_mask=factual_mask,
         )
-        all_shallow = torch.cat([observed_shallow, predicted_shallow], dim=1)
-        # Predictor action seeds for the final input sequence cover all but the
-        # terminal predicted state.  That state receives an explicit learned
-        # null because no action beyond the requested horizon is available.
-        input_seed = final_predictor["predicted_action_tokens"]
-        terminal = self.terminal_action_seed.view(1, 1, 1, -1).expand(
-            b, 1, views, -1
-        ).to(device=input_seed.device, dtype=input_seed.dtype)
-        deep_action_seed = torch.cat([input_seed, terminal], dim=1)
-        if deep_action_seed.shape[:3] != all_shallow.shape[:3]:
-            raise RuntimeError("VGGT visual/action rollout lengths do not align")
+        predicted_shallow = (
+            state_output.factual_tokens
+            if mode is GeometryConditionMode.FACTUAL
+            else state_output.action_free_tokens
+        )
 
-        if future_view_valid_mask is None:
-            future_view_valid_mask = observed_view_valid_mask[:, -1:].expand(
-                b, self.future_anchor_count, views
-            )
-        else:
-            future_view_valid_mask = future_view_valid_mask.to(
-                device=observed_images.device, dtype=torch.bool
-            )
-            if future_view_valid_mask.shape != (
-                b,
-                self.future_anchor_count,
-                views,
-            ):
-                raise ValueError("future_view_valid_mask shape mismatch")
-        if not bool(future_view_valid_mask.all()):
-            raise ValueError(
-                "padded future views are not allowed in the VGGT deep path; "
-                "bucket windows by their exact real view count"
-            )
-        all_view_mask = torch.cat(
-            [observed_view_valid_mask, future_view_valid_mask], dim=1
+        anchor_index = torch.tensor(
+            self.geometry_anchor_indices,
+            device=predicted_shallow.device,
+            dtype=torch.long,
         )
-        step_valid = all_view_mask.any(dim=2)
-        student_geometry = self.encoder.propagate_shallow_with_actions_grad(
+        predicted_anchors = predicted_shallow.index_select(1, anchor_index)
+        anchor_view_mask = future_view_valid_mask.index_select(1, anchor_index)
+        all_shallow = torch.cat((observed_shallow, predicted_anchors), dim=1)
+        all_view_mask = torch.cat(
+            (observed_view_valid_mask, anchor_view_mask), dim=1
+        )
+        student_geometry = self.encoder.propagate_shallow_without_actions_grad(
             all_shallow,
-            deep_action_seed,
             decode_visuals=decode_geometry_heads,
             dpt_chunk_size=1,
             gradient_checkpointing=gradient_checkpointing,
             return_multi_level=False,
-            step_valid_mask=step_valid,
+            step_valid_mask=all_view_mask.any(dim=2),
             deep_temporal_causal_mask=True,
         )
         deep_visual = student_geometry["deep_visual_tokens"]
-        future_deep = deep_visual[:, -self.future_anchor_count :]
+        future_deep = deep_visual[:, -self.geometry_anchor_count :]
         geometry_tokens, geometry_mask = self.geometry_reducer(
-            future_deep, future_view_valid_mask
+            future_deep, anchor_view_mask
         )
 
         target_shallow = None
         target_geometry = None
         if future_target_images is not None:
-            tb, target_steps, target_views = self._validate_images(
+            target_batch, target_steps, target_views = self._validate_images(
                 "future_target_images", future_target_images
             )
-            if (tb, target_steps, target_views) != (
-                b,
-                self.future_anchor_count,
+            if (target_batch, target_steps, target_views) != (
+                batch,
+                self.future_steps,
                 views,
             ):
-                raise ValueError("future target RGB does not align with anchors/views")
+                raise ValueError("future RGB targets must align with [B,K,V]")
             target_shallow = self._encode_shallow(future_target_images).detach()
             if compute_target_geometry:
+                target_anchor_mask = future_world_valid_mask.index_select(
+                    1, anchor_index
+                )
+                if not bool(target_anchor_mask.all()):
+                    raise ValueError(
+                        "every sparse geometry anchor needs a recorded RGB target"
+                    )
+                target_anchors = target_shallow.index_select(1, anchor_index)
                 with torch.no_grad():
                     target_geometry = self.encoder.propagate_shallow_without_actions(
-                        target_shallow,
+                        target_anchors,
                         decode_visuals=decode_geometry_heads,
                         dpt_chunk_size=1,
                     )
@@ -429,17 +403,20 @@ class OnlineVGGTGeometryCore(nn.Module):
                         for key, value in target_geometry.items()
                     }
         elif compute_target_geometry:
-            raise ValueError("target geometry requires future_target_images")
+            raise ValueError("target geometry requires future RGB targets")
 
         return OnlineGeometryOutput(
             mode=mode,
             observed_shallow_tokens=observed_shallow,
             predicted_future_shallow_tokens=predicted_shallow,
-            predicted_action_seed_tokens=predicted_seed,
-            predicted_future_proprio_tokens=predicted_proprio,
+            action_free_future_shallow_tokens=state_output.action_free_tokens,
+            action_free_native_state=state_output.action_free_native_state,
+            native_state=state_output.native_state,
             deep_visual_tokens=deep_visual,
             geometry_tokens=geometry_tokens,
             geometry_token_mask=geometry_mask,
+            geometry_anchor_indices=self.geometry_anchor_indices,
+            geometry_anchor_valid_mask=anchor_view_mask,
             student_geometry=student_geometry,
             target_future_shallow_tokens=target_shallow,
             target_geometry=target_geometry,

@@ -107,7 +107,7 @@ def seed_everything(seed: int, *, rank_offset: bool) -> None:
 def _transformer_layer_types(_module: nn.Module) -> set[type[nn.Module]]:
     # Only wrap blocks whose complete forward owns every parameter use.
     # TransformerEncoderLayer calls MultiheadAttention.out_proj functionally,
-    # while GAM's causal VGGT path calls block.norm/qkv/attention directly.
+    # while the causal VGGT resume path calls block.norm/qkv/attention directly.
     # Wrapping either block type separately therefore leaves raw weights
     # sharded when those functional paths read them. MoT likewise accesses
     # both experts' DiTBlock internals directly instead of calling each block.

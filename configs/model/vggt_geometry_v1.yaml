@@ -1,6 +1,9 @@
 observed_keyframe_indices: [0, 5, 10, 15]
-future_anchor_count: 4
+future_steps: 16
+future_times_s: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6]
+geometry_anchor_indices: [3, 7, 11, 15]
 geometry_output_patch_grid: 4
+shallow_scene_chunk_size: 8
 
 encoder:
   _target_: wm3d_wam.vendor.vggt_gam.vggt_encoder.VGGTEncoder
@@ -19,25 +22,26 @@ encoder:
   deep_time_mode: causal
   local_files_only: true
 
-future_predictor:
-  _target_: wm3d_wam.vendor.vggt_gam.future_predictor.GAMFuturePredictor
-  integration_status: grouped_history_bridge_implemented
-  d_da3: 1024
-  d_model: 1024
-  depth: 12
-  num_heads: 16
-  ffn_ratio: 4.0
-  dropout: 0.0
-  num_patches_per_view: 256
-  num_register_tokens: 4
-  use_language: true
+state_dynamics:
+  _target_: wm3d_wam.models.WM3DStateDynamicsCore
+  # Original WM3D 1B state-prior width/depth. Token count/dim, K, history
+  # width, and real-view capacity are bound to the live VGGT/data ABI by the
+  # factory and cannot drift through YAML overrides.
+  state_hidden: 1600
+  state_layers: 18
+  state_heads: 16
+  state_ff_mult: 2.5
+  dynamics_layers: 1
+  view_hidden: 1024
+  view_heads: 8
+  view_ff_mult: 2.5
+  history_dim: 1024
   language_dim: 4096
-  language_len: 128
-  condition_mode: cross_attn
-  input_proj_norm: ln
-  gradient_checkpointing: true
-  observed_keyframes: 4
-  future_anchor_times_s: [0.4, 0.8, 1.2, 1.6]
+  time_fourier_dim: 128
+  time_min_period_s: 0.01
+  time_max_period_s: 120.0
+  dropout: 0.0
+  activation_checkpointing: true
 
 history_connector:
   _target_: wm3d_wam.models.GroupedHistoryConnector
@@ -53,8 +57,3 @@ history_connector:
   num_heads: 16
   ffn_ratio: 4.0
   dropout: 0.0
-
-auxiliary_action_heads:
-  _target_: wm3d_wam.models.GroupedGeometryActionHeads
-  num_heads: 16
-  ffn_ratio: 2.0

@@ -220,6 +220,7 @@ class OnlineRobotDataset(Dataset[OnlineTrainingSample]):
                     episode=episode,
                     source_contract=catalog.contract,
                     normalization=self.normalization,
+                    program=request.program,
                     anchor_fraction=anchor_fraction,
                     target_view_fraction=view_fraction,
                     sample_index=request.global_sample_index,
@@ -305,7 +306,8 @@ def collate_online_training_samples(
     first = windows[0]
     for window in windows[1:]:
         if (
-            window.source != first.source
+            window.program != first.program
+            or window.source != first.source
             or window.source_id != first.source_id
             or window.target_view_index != first.target_view_index
             or window.valid_view_count != first.valid_view_count
@@ -315,10 +317,11 @@ def collate_online_training_samples(
             )
         for name in (
             "observed_images",
-            "future_anchor_images",
+            "future_world_images",
             "wan_video",
             "observed_view_valid_mask",
             "future_view_valid_mask",
+            "future_world_valid_mask",
         ):
             if getattr(window, name).shape != getattr(first, name).shape:
                 raise SourceContractError(
@@ -337,6 +340,7 @@ def collate_online_training_samples(
         [window.future_actions for window in windows]
     )
     batch_window = OnlineRobotWindow(
+        program=first.program,
         source=first.source,
         source_id=first.source_id,
         episode_id=first.episode_id,
@@ -344,8 +348,8 @@ def collate_online_training_samples(
         observed_images=torch.stack(
             [window.observed_images for window in windows], dim=0
         ),
-        future_anchor_images=torch.stack(
-            [window.future_anchor_images for window in windows], dim=0
+        future_world_images=torch.stack(
+            [window.future_world_images for window in windows], dim=0
         ),
         wan_video=torch.stack([window.wan_video for window in windows], dim=0),
         observed_view_valid_mask=torch.stack(
@@ -354,12 +358,18 @@ def collate_online_training_samples(
         future_view_valid_mask=torch.stack(
             [window.future_view_valid_mask for window in windows], dim=0
         ),
+        future_world_valid_mask=torch.stack(
+            [window.future_world_valid_mask for window in windows], dim=0
+        ),
         state_history=state_history,
         action_history=action_history,
         future_action_history=future_action_history,
         future_actions=future_actions,
         observation_times_s=torch.stack(
             [window.observation_times_s for window in windows], dim=0
+        ),
+        future_world_times_s=torch.stack(
+            [window.future_world_times_s for window in windows], dim=0
         ),
         future_video_times_s=torch.stack(
             [window.future_video_times_s for window in windows], dim=0

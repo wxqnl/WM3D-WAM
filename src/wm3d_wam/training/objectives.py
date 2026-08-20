@@ -6,9 +6,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-
-from wm3d_wam.data.action_events import GroupedActionBatch
-from wm3d_wam.models.geometry_action_heads import GroupedAuxiliaryActionOutput
 from wm3d_wam.models.online_vggt_geometry import OnlineGeometryOutput
 
 
@@ -16,6 +13,7 @@ from wm3d_wam.models.online_vggt_geometry import OnlineGeometryOutput
 class GeometryObjectiveLoss:
     total: torch.Tensor
     future_feature: torch.Tensor
+    action_free_future_feature: torch.Tensor
     depth: torch.Tensor
     world_points: torch.Tensor
     camera_pose: torch.Tensor
@@ -24,23 +22,12 @@ class GeometryObjectiveLoss:
         return {
             "loss_total": float(self.total.detach()),
             "loss_future_feature": float(self.future_feature.detach()),
+            "loss_action_free_future_feature": float(
+                self.action_free_future_feature.detach()
+            ),
             "loss_depth": float(self.depth.detach()),
             "loss_world_points": float(self.world_points.detach()),
             "loss_camera_pose": float(self.camera_pose.detach()),
-        }
-
-
-@dataclass(frozen=True)
-class GroupedAuxiliaryActionLoss:
-    total: torch.Tensor
-    direct: torch.Tensor
-    refined: torch.Tensor
-
-    def detached_metrics(self) -> dict[str, float]:
-        return {
-            "loss_aux_action": float(self.total.detach()),
-            "loss_aux_action_direct": float(self.direct.detach()),
-            "loss_aux_action_refined": float(self.refined.detach()),
         }
 
 
@@ -74,8 +61,9 @@ def _future_student_rows(
 def geometry_objective_loss(
     output: OnlineGeometryOutput,
     *,
-    future_view_valid_mask: torch.Tensor,
+    future_world_valid_mask: torch.Tensor,
     feature_weight: float = 1.0,
+    action_free_feature_weight: float = 0.0,
     geometry_weight: float = 0.3,
 ) -> GeometryObjectiveLoss:
     """Stage-A/forward-world geometry loss with detached online targets."""
@@ -87,7 +75,7 @@ def geometry_objective_loss(
     if prediction.shape != target.shape:
         raise ValueError("predicted and target shallow token shapes do not match")
     b, future_steps, views = prediction.shape[:3]
-    view_mask = future_view_valid_mask.to(
+    view_mask = future_world_valid_mask.to(
         device=prediction.device, dtype=torch.bool
     )
     if view_mask.shape != (b, future_steps, views):
@@ -99,6 +87,13 @@ def geometry_objective_loss(
         prediction.float(), target.float(), dim=-1
     )
     feature_loss = _masked_mean(cosine, view_mask)
+    action_free_prediction = output.action_free_future_shallow_tokens
+    if action_free_prediction.shape != target.shape:
+        raise ValueError("action-free and target shallow token shapes do not match")
+    action_free_cosine = 1.0 - F.cosine_similarity(
+        action_free_prediction.float(), target.float(), dim=-1
+    )
+    action_free_feature_loss = _masked_mean(action_free_cosine, view_mask)
     zero = feature_loss.new_zeros(())
     depth_loss = zero
     points_loss = zero
@@ -108,6 +103,13 @@ def geometry_objective_loss(
     target_geometry = output.target_geometry
     if target_geometry is not None:
         total_steps = int(output.deep_visual_tokens.shape[1])
+        anchor_count = len(output.geometry_anchor_indices)
+        anchor_index = torch.tensor(
+            output.geometry_anchor_indices,
+            device=view_mask.device,
+            dtype=torch.long,
+        )
+        geometry_view_mask = view_mask.index_select(1, anchor_index)
         student = output.student_geometry
         for key in ("depth", "world_points", "pose_enc"):
             if key in target_geometry and target_geometry[key].requires_grad:
@@ -117,11 +119,11 @@ def geometry_objective_loss(
                 student["depth"],
                 batch_size=b,
                 total_steps=total_steps,
-                future_steps=future_steps,
+                future_steps=anchor_count,
                 views=views,
             )
             depth_target = target_geometry["depth"].reshape_as(depth_prediction)
-            valid_depth = view_mask
+            valid_depth = geometry_view_mask
             depth_loss = _masked_mean(
                 F.smooth_l1_loss(
                     depth_prediction.float(), depth_target.float(), reduction="none"
@@ -134,7 +136,7 @@ def geometry_objective_loss(
                 student["world_points"],
                 batch_size=b,
                 total_steps=total_steps,
-                future_steps=future_steps,
+                future_steps=anchor_count,
                 views=views,
             )
             point_target = target_geometry["world_points"].reshape_as(
@@ -144,7 +146,7 @@ def geometry_objective_loss(
                 F.smooth_l1_loss(
                     point_prediction.float(), point_target.float(), reduction="none"
                 ),
-                view_mask,
+                geometry_view_mask,
             )
             geometry_terms.append(points_loss)
         if "pose_enc" in student and "pose_enc" in target_geometry:
@@ -152,7 +154,7 @@ def geometry_objective_loss(
                 student["pose_enc"],
                 batch_size=b,
                 total_steps=total_steps,
-                future_steps=future_steps,
+                future_steps=anchor_count,
                 views=views,
             )
             pose_target = target_geometry["pose_enc"].reshape_as(pose_prediction)
@@ -160,48 +162,21 @@ def geometry_objective_loss(
                 F.smooth_l1_loss(
                     pose_prediction.float(), pose_target.float(), reduction="none"
                 ),
-                view_mask,
+                geometry_view_mask,
             )
             geometry_terms.append(pose_loss)
 
     geometry = torch.stack(geometry_terms).mean() if geometry_terms else zero
-    total = float(feature_weight) * feature_loss + float(geometry_weight) * geometry
+    total = (
+        float(feature_weight) * feature_loss
+        + float(action_free_feature_weight) * action_free_feature_loss
+        + float(geometry_weight) * geometry
+    )
     return GeometryObjectiveLoss(
         total=total,
         future_feature=feature_loss,
+        action_free_future_feature=action_free_feature_loss,
         depth=depth_loss,
         world_points=points_loss,
         camera_pose=pose_loss,
-    )
-
-
-def grouped_auxiliary_action_loss(
-    prediction: GroupedAuxiliaryActionOutput,
-    target: GroupedActionBatch,
-) -> GroupedAuxiliaryActionLoss:
-    """Normalize direct/refined action losses by valid native-rate scalars."""
-
-    if prediction.direct.shape != target.values.shape or prediction.refined.shape != target.values.shape:
-        raise ValueError("auxiliary action predictions must match grouped targets")
-    valid = (
-        target.value_mask.to(dtype=torch.bool)
-        & target.event_mask[:, :, None, None].to(dtype=torch.bool)
-        & target.group_mask[:, None, :, None].to(dtype=torch.bool)
-    )
-    counts = valid.flatten(1).sum(dim=1)
-    if bool((counts == 0).any()):
-        raise ValueError("every auxiliary action sample needs a valid scalar")
-
-    def loss(value: torch.Tensor) -> torch.Tensor:
-        elementwise = F.smooth_l1_loss(
-            value.float(), target.values.float(), reduction="none"
-        )
-        return ((elementwise * valid).flatten(1).sum(dim=1) / counts).mean()
-
-    direct = loss(prediction.direct)
-    refined = loss(prediction.refined)
-    return GroupedAuxiliaryActionLoss(
-        total=0.5 * (direct + refined),
-        direct=direct,
-        refined=refined,
     )

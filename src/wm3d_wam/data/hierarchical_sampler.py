@@ -12,7 +12,7 @@ from .source_contracts import SourceContract, SourceContractError
 
 
 PROGRAM_FAMILY_MIX: Mapping[str, Mapping[str, float]] = {
-    "geometry_pretrain": {"oxe": 0.70, "robocasa": 0.30},
+    "world_core_pretrain": {"oxe": 0.70, "robocasa": 0.30},
     "action_only": {"oxe": 0.70, "robocasa": 0.30},
     "forward_world": {"oxe": 0.40, "robocasa": 0.60},
     "joint_world_action": {"oxe": 0.60, "robocasa": 0.40},

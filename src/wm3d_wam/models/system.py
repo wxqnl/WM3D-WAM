@@ -13,7 +13,6 @@ from wm3d_wam.data.online_episode import OnlineRobotWindow
 from wm3d_wam.vendor.fastwam.wan22.wan_video_vae import WanVideoVAE38
 
 from .interaction_masks import InteractionProgram
-from .geometry_action_heads import GroupedAuxiliaryActionOutput
 from .online_vggt_geometry import (
     GeometryConditionMode,
     OnlineGeometryOutput,
@@ -27,7 +26,6 @@ class WM3DWAMProgramOutput:
     program: InteractionProgram
     geometry: OnlineGeometryOutput
     mot: WanActionOutput
-    auxiliary_actions: Optional[GroupedAuxiliaryActionOutput]
 
 
 class WM3DWAMSystem(nn.Module):
@@ -65,8 +63,8 @@ class WM3DWAMSystem(nn.Module):
             video = video.unsqueeze(0)
         if video.ndim != 5 or video.shape[1] != 3:
             raise ValueError("Wan RGB must be [B,3,T,H,W] or [3,T,H,W]")
-        if video.shape[2] != 9:
-            raise ValueError("v1 Wan windows must contain exactly 9 frames")
+        if video.shape[2] not in {1, 17}:
+            raise ValueError("Wan windows must contain an anchor or 17-frame clip")
         if video.shape[-2] % 16 or video.shape[-1] % 16:
             raise ValueError("Wan RGB spatial dimensions must be divisible by 16")
         if not torch.is_floating_point(video) or not bool(torch.isfinite(video).all()):
@@ -77,7 +75,12 @@ class WM3DWAMSystem(nn.Module):
         model_dtype = next(self.video_vae.parameters()).dtype
         normalized = video.to(device=model_device, dtype=model_dtype) * 2.0 - 1.0
         latents = self.video_vae.encode(normalized, device=model_device)
-        if latents.ndim != 5 or latents.shape[1] != 48 or latents.shape[2] != 3:
+        expected_latent_steps = 1 if video.shape[2] == 1 else 5
+        if (
+            latents.ndim != 5
+            or latents.shape[1] != 48
+            or latents.shape[2] != expected_latent_steps
+        ):
             raise RuntimeError(
                 "Wan2.2 VAE produced an unexpected latent shape: "
                 f"{tuple(latents.shape)}"
@@ -128,7 +131,7 @@ class WM3DWAMSystem(nn.Module):
         geometry_mode = (
             GeometryConditionMode.FACTUAL
             if mode is InteractionProgram.FORWARD_WORLD
-            else GeometryConditionMode.POLICY
+            else GeometryConditionMode.ACTION_FREE
         )
         future_action_history = (
             window.future_action_history
@@ -137,7 +140,7 @@ class WM3DWAMSystem(nn.Module):
         )
         future_target_images = (
             self._batched_images(
-                window.future_anchor_images, name="future_anchor_images"
+                window.future_world_images, name="future_world_images"
             )
             if include_future_targets
             else None
@@ -148,6 +151,7 @@ class WM3DWAMSystem(nn.Module):
             ),
             state_history=window.state_history,
             action_history=window.action_history,
+            future_world_times_s=window.future_world_times_s,
             mode=geometry_mode,
             future_action_history=future_action_history,
             future_target_images=future_target_images,
@@ -161,20 +165,14 @@ class WM3DWAMSystem(nn.Module):
                 window.future_view_valid_mask,
                 name="future_view_valid_mask",
             ),
+            future_world_valid_mask=self._batched_view_mask(
+                window.future_world_valid_mask,
+                name="future_world_valid_mask",
+            ),
             decode_geometry_heads=decode_geometry_heads,
             compute_target_geometry=compute_target_geometry,
             gradient_checkpointing=geometry_gradient_checkpointing,
         )
-        auxiliary_actions = None
-        if mode is not InteractionProgram.FORWARD_WORLD:
-            auxiliary_actions = self.geometry_core.predict_auxiliary_actions(
-                geometry,
-                action_template=window.future_actions,
-                future_view_valid_mask=self._batched_view_mask(
-                    window.future_view_valid_mask,
-                    name="future_view_valid_mask",
-                ),
-            )
         mot = self.wan_action(
             program=mode,
             video_latents=video_latents,
@@ -190,5 +188,4 @@ class WM3DWAMSystem(nn.Module):
             program=mode,
             geometry=geometry,
             mot=mot,
-            auxiliary_actions=auxiliary_actions,
         )

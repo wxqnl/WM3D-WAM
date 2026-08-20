@@ -1,89 +1,87 @@
 # WM3D-WAM
 
-WM3D-WAM is a world-action model that combines three production-width paths:
+WM3D-WAM is a world-action model built from three large, reusable components:
 
-- online VGGT-1B split-and-resume geometry;
-- Wan2.2 TI2V-5B video flow;
-- a source-native Grouped Action Flow Expert coupled to Wan at every transformer layer.
+- the original WM3D state prior and factual dynamics, adapted to VGGT tokens;
+- online VGGT-1B shallow encoding and deep geometry propagation;
+- Wan2.2 TI2V-5B plus a Wan-coupled Grouped Action Flow Expert.
 
-Video uses one 5 Hz, 9-frame, 1.6-second bucket. Robot commands keep their
-recorded 5/10/15/20 Hz clock. A nominal future chunk contains 8/16/24/32
-action events; timestamp jitter may retain one boundary event, so padded
-capacity is computed with the exact integer horizon as `source_hz * 8 // 5 + 1`.
-Training reads raw Parquet and MP4
-data online. It does not require a VGGT, depth, point, pose, or Wan-latent
-cache.
+The world grid is fixed at `K=16` over 1.6 seconds, or 10 Hz. Wan receives the
+current frame plus all 16 future frames, so a video window contains 17 RGB
+frames and encodes to five temporal latent positions. Robot commands keep their
+recorded 5/10/15/20 Hz clock. They are assigned to 16 physical-time bins
+without interpolation, repetition, or rate conversion.
 
-## Current implementation
+VGGT runs inside every model forward. Training reads raw Parquet and MP4 and
+does not require a VGGT, depth, point, pose, or Wan-latent cache.
 
-- explicit contracts for all 21 sources: 7 verified sources enter training
-  and 14 sources remain excluded until their stored controller semantics are
-  proven;
-- deterministic episode-level train/val/test materialization, with
-  parent-trajectory grouping when a manifest supplies it;
-- recorded-timestamp window selection, exact native-rate action events, and a
-  grouped state/action history connector;
-- online frozen VGGT pairs 0–3, autoregressive four-anchor GAM prediction,
-  trainable pairs 4–23, geometry heads, and direct/refined grouped auxiliary
-  actions;
-- local-only Wan2.2 DiT, VAE, UMT5, and tokenizer loading;
-- a 30-layer 1024-wide grouped ActionDiT initialized from Wan2.2 with the
-  FastWAM interpolation rule;
-- `action_only`, `forward_world`, and `joint_world_action` flow objectives;
-- deployment-identical observed-video K/V prefill for action training and
-  inference;
-- exact Stage A/B/C optimizer ownership and learning rates.
-- a deterministic hierarchical program/family/source sampler, multi-process
-  DataLoader, multi-GPU FSDP, validation, numbered checkpoints, exact resume,
-  and deliberate cross-stage initialization.
+## Architecture contract
 
-Production-width preflights have run on real OXE Bridge and RoboCasa Atomic
-windows with the official local model weights. See
-[docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) for results and
-[docs/TRAINING.md](docs/TRAINING.md) for commands.
+- Frozen VGGT pairs 0–3 encode four observed multi-view keyframes.
+- The 876M-parameter WM3D core fuses real views, robot history, task language,
+  and physical time, then predicts 16 action-free future world states.
+- A separate factual-dynamics block refines that completed prior with recorded
+  future actions when the route permits factual conditioning.
+- A per-view decoder maps every dense world state back to the VGGT shallow-token
+  ABI.
+- Trainable VGGT pairs 4–23 resume at 0.4/0.8/1.2/1.6-second anchors and produce
+  geometry tokens for Wan/Action attention.
+- Wan2.2 owns RGB velocity prediction. Grouped ActionDiT owns action velocity
+  prediction. The two experts exchange information through mixed attention at
+  every transformer layer.
+
+GAM is not the world-model core and has no active policy or action head in the
+factory graph. The repository keeps its vendored VGGT adapter as implementation
+provenance for the shallow/deep split.
+
+## Data contract
+
+Seven audited sources enter training; fourteen sources stay excluded until
+their stored controller semantics are proven. Splits are materialized at the
+episode or parent-trajectory level before window sampling.
+
+For sources at 10 Hz or faster, all 16 world targets are real recorded frames.
+A genuine 5 Hz source provides eight real targets at 0.2-second intervals;
+those supervise slots `1,3,...,15`, while the missing 0.1-second slots are
+masked. The loader never fills a missing world step by copying a frame.
+
+The active routes are:
+
+- `world_core_pretrain`: factual world rollout with online feature and geometry
+  supervision; Wan and ActionDiT are not loaded;
+- `action_only`: action flow from the observed frame, task, robot history, and
+  action-free world state;
+- `forward_world`: video flow and factual world dynamics conditioned on clean
+  recorded actions;
+- `joint_world_action`: coupled action/video flow with an action-free world
+  state, which prevents clean future-action leakage.
 
 ## Repository layout
 
 ```text
-src/wm3d_wam/data/       timestamp, split, grouped robot, and online RGB I/O
-src/wm3d_wam/models/     online VGGT-GAM, Wan/Action MoT, and system composition
-src/wm3d_wam/training/   flow objectives, Stage A pipeline, and optimizer groups
-src/wm3d_wam/vendor/     licensed FastWAM and VGGT-GAM components
-scripts/                 asset preparation and reproducible preflight programs
-configs/                 production model/data/training contracts
+src/wm3d_wam/data/       source contracts, time windows, grouped robot ABI, RGB I/O
+src/wm3d_wam/models/     WM3D state core, online VGGT, Wan/Action MoT
+src/wm3d_wam/training/   objectives, parameter ownership, FSDP, checkpoints
+src/wm3d_wam/vendor/     pinned FastWAM and VGGT adapter code
+scripts/                 split materialization, preflights, formal trainer
+configs/                 production data, model, and training contracts
 ```
 
 ## Tests
 
-Run on New-H100-2 from the project directory:
+Run only on New-H100-2 from `/data/Minko/WM3D-WAM`:
 
 ```bash
-cd /data/Minko/WM3D-WAM
-PYTHONPATH=src /data/Minko/.venvs/wm3d/bin/python -m pytest -q
+CUDA_VISIBLE_DEVICES="" PYTHONPATH=src \
+  /data/Minko/.venvs/wm3d/bin/python -m pytest -q
 ```
 
-The current suite has 60 passing tests. GPU 0 is forbidden by the project
-runtime contract; GPU experiments must use physical devices 1–7.
-
-## Formal-training status
-
-The checked-in formal profile uses physical GPUs `1,2,3,4,5,6,7`. Stage A/B/C
-first passed production-width FSDP canaries and exact checkpoint recovery on
-the five-card mesh `1,2,5,6,7`; the seven-card Stage A formal run started on
-2026-08-20. Full-phase rank-local resume and Stage B-to-C initialization must
-keep the same ordered seven-card mesh.
-The sampler admits only `oxe_bridge`, `oxe_droid`, `oxe_furniture_bench`,
-`oxe_bc_z`, `robocasa_atomic`, `robocasa_composite`, and `robocasa_mg`.
-
-The code path is ready for formal training on those seven sources. Adding any
-of the other fourteen sources still requires a payload-level unit, frame,
-composition, and gripper-polarity audit; the loader rejects them instead of
-guessing.
+GPU 0 is reserved. GPU work may use physical devices 1–7 only.
 
 ## Documents
 
-- [v1 design](docs/WM3D_WAM_V1_DESIGN.md)
+- [complete design](docs/WM3D_WAM_V1_DESIGN.md)
 - [implementation base and status](docs/IMPLEMENTATION_BASE.md)
-- [training and asset runbook](docs/TRAINING.md)
-- [preliminary experiments](docs/EXPERIMENTS.md)
+- [training runbook](docs/TRAINING.md)
+- [validation experiments](docs/EXPERIMENTS.md)
 - [third-party notices](THIRD_PARTY_NOTICES.md)
