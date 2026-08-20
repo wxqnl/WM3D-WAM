@@ -62,13 +62,17 @@ class OnlineTrainingSample:
         if not np.isfinite(self.quality_weights).all() or any(
             weight <= 0.0 for weight in self.quality_weights
         ):
-            raise SourceContractError("online micro-batch has an invalid quality weight")
+            raise SourceContractError(
+                "online micro-batch has an invalid quality weight"
+            )
         routes = {
             (request.program, request.family, request.source)
             for request in self.requests
         }
         if len(routes) != 1:
-            raise SourceContractError("one micro-batch must share a routed model schema")
+            raise SourceContractError(
+                "one micro-batch must share a routed model schema"
+            )
 
     @property
     def request(self) -> WindowRequest:
@@ -83,15 +87,23 @@ class OnlineTrainingSample:
     @property
     def quality_weight(self) -> float:
         first = float(self.quality_weights[0])
-        if any(abs(float(value) - first) > 1.0e-12 for value in self.quality_weights[1:]):
-            raise SourceContractError("one micro-batch must share a source quality weight")
+        if any(
+            abs(float(value) - first) > 1.0e-12 for value in self.quality_weights[1:]
+        ):
+            raise SourceContractError(
+                "one micro-batch must share a source quality weight"
+            )
         return first
 
 
 def _load_split_ids(path: Path) -> set[str]:
     if not path.is_file():
         raise SourceContractError(f"episode split file is missing: {path}")
-    values = {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
+    values = {
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
     if not values:
         raise SourceContractError(f"episode split file is empty: {path}")
     return values
@@ -152,14 +164,20 @@ class OnlineRobotDataset(Dataset[OnlineTrainingSample]):
                 )
             catalogs[source] = SourceEpisodeCatalog(
                 contract=contract,
-                source_root=Path(str(row["raw_root"])).expanduser().resolve(strict=True),
-                adapter_path=Path(str(row["adapter_config"])).expanduser().resolve(strict=True),
+                source_root=Path(str(row["raw_root"]))
+                .expanduser()
+                .resolve(strict=True),
+                adapter_path=Path(str(row["adapter_config"]))
+                .expanduser()
+                .resolve(strict=True),
                 manifest_path=manifest_path,
                 profile_weight=float(row["weight"]),
                 episodes=episodes,
             )
         if not catalogs:
-            raise SourceContractError("no verified source has episodes in the requested split")
+            raise SourceContractError(
+                "no verified source has episodes in the requested split"
+            )
         self.profile_path = profile_path
         self.registry = registry
         self.normalization = normalization
@@ -210,9 +228,11 @@ class OnlineRobotDataset(Dataset[OnlineTrainingSample]):
             anchor_fraction = (
                 request.anchor_fraction + retry * 0.6180339887498949
             ) % 1.0
-            view_fraction = (
-                request.target_view_fraction + retry * 0.4142135623730950
-            ) % 1.0
+            # The target view is part of the routed micro-batch schema. A
+            # decode retry may move to another episode/window, but it must not
+            # silently route one sample to another camera slot while the other
+            # samples in the same micro-batch retain the original slot.
+            view_fraction = request.target_view_fraction
             try:
                 window = load_online_robot_window(
                     source_root=catalog.source_root,
@@ -301,19 +321,32 @@ def collate_online_training_samples(
     """Stack a real micro-batch without changing clocks, views, or events."""
 
     if not values or any(value.batch_size != 1 for value in values):
-        raise SourceContractError("DataLoader collate expects non-empty singleton samples")
+        raise SourceContractError(
+            "DataLoader collate expects non-empty singleton samples"
+        )
     windows = [value.window for value in values]
     first = windows[0]
     for window in windows[1:]:
-        if (
-            window.program != first.program
-            or window.source != first.source
-            or window.source_id != first.source_id
-            or window.target_view_index != first.target_view_index
-            or window.valid_view_count != first.valid_view_count
-        ):
+        expected_schema = (
+            first.program,
+            first.source,
+            first.source_id,
+            first.target_view_index,
+            first.valid_view_count,
+        )
+        actual_schema = (
+            window.program,
+            window.source,
+            window.source_id,
+            window.target_view_index,
+            window.valid_view_count,
+        )
+        if actual_schema != expected_schema:
             raise SourceContractError(
-                "micro-batch windows do not share source/view schema"
+                "micro-batch windows do not share source/view schema: "
+                f"expected={expected_schema!r}, actual={actual_schema!r}, "
+                f"sample_indices={[item.sample_index for item in windows]!r}, "
+                f"decode_retries={[item.decode_retry_count for item in windows]!r}"
             )
         for name in (
             "observed_images",
@@ -327,18 +360,14 @@ def collate_online_training_samples(
                 raise SourceContractError(
                     f"micro-batch tensor shape differs for {name}"
                 )
-    state_history = _cat_state_histories(
-        [window.state_history for window in windows]
-    )
+    state_history = _cat_state_histories([window.state_history for window in windows])
     action_history = _cat_action_timelines(
         [window.action_history for window in windows]
     )
     future_action_history = _cat_action_timelines(
         [window.future_action_history for window in windows]
     )
-    future_actions = _cat_action_batches(
-        [window.future_actions for window in windows]
-    )
+    future_actions = _cat_action_batches([window.future_actions for window in windows])
     batch_window = OnlineRobotWindow(
         program=first.program,
         source=first.source,
@@ -387,9 +416,7 @@ def collate_online_training_samples(
         requests=tuple(request for value in values for request in value.requests),
         window=batch_window,
         task_texts=tuple(text for value in values for text in value.task_texts),
-        episode_ids=tuple(
-            episode for value in values for episode in value.episode_ids
-        ),
+        episode_ids=tuple(episode for value in values for episode in value.episode_ids),
         quality_weights=tuple(
             weight for value in values for weight in value.quality_weights
         ),
@@ -422,9 +449,7 @@ def build_online_dataloader(
     ):
         raise SourceContractError("invalid DataLoader worker/prefetch configuration")
     worker_generator = torch.Generator()
-    worker_generator.manual_seed(
-        int(sampler.seed) + 1_000_003 * int(sampler.rank)
-    )
+    worker_generator.manual_seed(int(sampler.seed) + 1_000_003 * int(sampler.rank))
     kwargs: dict[str, object] = {
         "dataset": dataset,
         "sampler": sampler,

@@ -266,9 +266,7 @@ def save_checkpoint(
             cpu_offload=False,
             strict=True,
         )
-        model_state, optimizer_state = get_state_dict(
-            model, optimizer, options=options
-        )
+        model_state, optimizer_state = get_state_dict(model, optimizer, options=options)
         payload: dict[str, object] = {
             "model": model_state,
             "optimizer": optimizer_state,
@@ -334,6 +332,49 @@ def resolve_checkpoint(path_or_root: str | Path) -> Path:
     return result
 
 
+def reshard_local_sample_cursor(
+    *,
+    saved_next_local_sample_index: int,
+    saved_world_size: int,
+    runtime_world_size: int,
+    micro_batch_size: int,
+) -> int:
+    """Map a canonical checkpoint cursor onto a new distributed world size.
+
+    The sampler has consumed the contiguous global range
+    ``[0, saved_next_local_sample_index * saved_world_size)``. A resharded
+    continuation is lossless only when that boundary maps to a complete local
+    micro-batch on every new rank.
+    """
+
+    if (
+        int(saved_next_local_sample_index) < 0
+        or int(saved_world_size) <= 0
+        or int(runtime_world_size) <= 0
+        or int(micro_batch_size) <= 0
+    ):
+        raise CheckpointError("invalid sampler cursor resharding parameters")
+    committed_global_samples = int(saved_next_local_sample_index) * int(
+        saved_world_size
+    )
+    next_local_index, remainder = divmod(
+        committed_global_samples, int(runtime_world_size)
+    )
+    if remainder:
+        raise CheckpointError(
+            "canonical checkpoint sampler cursor cannot be divided across the "
+            f"runtime world size: committed_global_samples={committed_global_samples}, "
+            f"runtime_world_size={runtime_world_size}"
+        )
+    if next_local_index % int(micro_batch_size):
+        raise CheckpointError(
+            "canonical checkpoint sampler cursor is not aligned to a runtime "
+            f"micro-batch: next_local_index={next_local_index}, "
+            f"micro_batch_size={micro_batch_size}"
+        )
+    return next_local_index
+
+
 def load_checkpoint(
     *,
     path_or_root: str | Path,
@@ -348,9 +389,11 @@ def load_checkpoint(
 ) -> ResumeState:
     path = resolve_checkpoint(path_or_root)
     metadata = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
+    schema = metadata.get("schema")
+    saved_world_size = int(metadata.get("world_size", -1))
+    runtime_world_size = _world_size()
     expected = {
         "phase": str(expected_phase),
-        "world_size": _world_size(),
         "seed": int(expected_seed),
         "gradient_accumulation_steps": int(expected_gradient_accumulation_steps),
         "micro_batch_size": int(expected_micro_batch_size),
@@ -360,8 +403,12 @@ def load_checkpoint(
             raise CheckpointError(
                 f"checkpoint {name} mismatch: saved={metadata.get(name)!r}, runtime={value!r}"
             )
-    schema = metadata.get("schema")
     if schema == LOCAL_FSDP_SCHEMA:
+        if saved_world_size != runtime_world_size:
+            raise CheckpointError(
+                "rank-local checkpoint world size mismatch: "
+                f"saved={saved_world_size}, runtime={runtime_world_size}"
+            )
         if expected_physical_cuda_devices is not None and metadata.get(
             "physical_cuda_devices"
         ) != [int(device) for device in expected_physical_cuda_devices]:
@@ -407,9 +454,7 @@ def load_checkpoint(
             cpu_offload=False,
             strict=True,
         )
-        model_state, optimizer_state = get_state_dict(
-            model, optimizer, options=options
-        )
+        model_state, optimizer_state = get_state_dict(model, optimizer, options=options)
         payload: dict[str, object] = {
             "model": model_state,
             "optimizer": optimizer_state,
@@ -432,11 +477,12 @@ def load_checkpoint(
     runtime = torch.load(runtime_path, map_location="cpu", weights_only=False)
     if not isinstance(runtime, Mapping):
         raise CheckpointError("rank runtime checkpoint is malformed")
-    for name, value in {
+    runtime_expected = {
         "rank": _rank(),
-        "world_size": _world_size(),
+        "world_size": saved_world_size,
         "seed": int(expected_seed),
-    }.items():
+    }
+    for name, value in runtime_expected.items():
         if int(runtime.get(name, -1)) != value:
             raise CheckpointError(
                 f"rank runtime {name} mismatch: saved={runtime.get(name)!r}, runtime={value}"
@@ -445,9 +491,21 @@ def load_checkpoint(
     if not isinstance(rng, Mapping):
         raise CheckpointError("rank runtime checkpoint has no RNG mapping")
     _restore_rng(rng)
-    next_index = int(runtime.get("next_local_sample_index", -1))
-    if next_index < 0 or next_index != int(metadata["next_local_sample_index"]):
+    saved_next_index = int(runtime.get("next_local_sample_index", -1))
+    if saved_next_index < 0 or saved_next_index != int(
+        metadata["next_local_sample_index"]
+    ):
         raise CheckpointError("rank and global sampler cursors differ")
+    next_index = (
+        saved_next_index
+        if saved_world_size == runtime_world_size
+        else reshard_local_sample_cursor(
+            saved_next_local_sample_index=saved_next_index,
+            saved_world_size=saved_world_size,
+            runtime_world_size=runtime_world_size,
+            micro_batch_size=expected_micro_batch_size,
+        )
+    )
     return ResumeState(
         checkpoint_path=path,
         global_step=int(metadata["global_step"]),
@@ -480,7 +538,9 @@ def load_model_only(
             )
         model_path = path / f"model_rank_{_rank():03d}.pt"
         if not model_path.is_file():
-            raise CheckpointError(f"rank-local model checkpoint is missing: {model_path}")
+            raise CheckpointError(
+                f"rank-local model checkpoint is missing: {model_path}"
+            )
         payload = torch.load(
             model_path,
             map_location=f"cuda:{torch.cuda.current_device()}"

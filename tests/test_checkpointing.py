@@ -11,6 +11,7 @@ from wm3d_wam.training.checkpointing import (
     load_checkpoint,
     load_model_only,
     prune_completed_checkpoints,
+    reshard_local_sample_cursor,
     save_checkpoint,
 )
 
@@ -39,7 +40,9 @@ def test_rank_local_checkpoint_restores_model_optimizer_scheduler_and_cursor(
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     torch.manual_seed(31)
     model, optimizer, scheduler = _training_objects()
-    expected = {name: value.detach().clone() for name, value in model.state_dict().items()}
+    expected = {
+        name: value.detach().clone() for name, value in model.state_dict().items()
+    }
 
     checkpoint = save_checkpoint(
         root=tmp_path,
@@ -73,9 +76,10 @@ def test_rank_local_checkpoint_restores_model_optimizer_scheduler_and_cursor(
     assert resumed.global_step == 3
     assert resumed.next_local_sample_index == 8
     assert restored_scheduler.state_dict() == scheduler.state_dict()
-    assert restored_optimizer.state_dict()["param_groups"] == optimizer.state_dict()[
-        "param_groups"
-    ]
+    assert (
+        restored_optimizer.state_dict()["param_groups"]
+        == optimizer.state_dict()["param_groups"]
+    )
     for name, value in restored_model.state_dict().items():
         torch.testing.assert_close(value, expected[name])
 
@@ -85,7 +89,9 @@ def test_rank_local_checkpoint_restores_model_optimizer_scheduler_and_cursor(
         torch.testing.assert_close(value, expected[name])
 
 
-def test_prune_completed_checkpoints_keeps_newest_and_ignores_incomplete(tmp_path) -> None:
+def test_prune_completed_checkpoints_keeps_newest_and_ignores_incomplete(
+    tmp_path,
+) -> None:
     for step in (1, 2, 3, 4):
         path = tmp_path / f"step_{step:08d}"
         path.mkdir()
@@ -148,4 +154,35 @@ def test_rank_local_checkpoint_rejects_a_different_physical_mesh(
             expected_gradient_accumulation_steps=1,
             expected_micro_batch_size=1,
             expected_physical_cuda_devices=[2],
+        )
+
+
+def test_canonical_cursor_reshards_without_reusing_global_samples() -> None:
+    assert (
+        reshard_local_sample_cursor(
+            saved_next_local_sample_index=4000,
+            saved_world_size=7,
+            runtime_world_size=5,
+            micro_batch_size=4,
+        )
+        == 5600
+    )
+
+
+@pytest.mark.parametrize(
+    ("saved_next", "saved_world", "runtime_world", "micro_batch", "message"),
+    [
+        (1, 7, 5, 1, "cannot be divided"),
+        (4, 7, 7, 3, "not aligned"),
+    ],
+)
+def test_canonical_cursor_rejects_a_lossy_reshard(
+    saved_next, saved_world, runtime_world, micro_batch, message
+) -> None:
+    with pytest.raises(CheckpointError, match=message):
+        reshard_local_sample_cursor(
+            saved_next_local_sample_index=saved_next,
+            saved_world_size=saved_world,
+            runtime_world_size=runtime_world,
+            micro_batch_size=micro_batch,
         )

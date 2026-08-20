@@ -168,7 +168,9 @@ class TrainerOptions:
                 "validation_samples_per_rank must contain complete micro-batches"
             )
         if self.resume is not None and self.initialize_from is not None:
-            raise TrainerError("exact resume and cross-phase initialization are mutually exclusive")
+            raise TrainerError(
+                "exact resume and cross-phase initialization are mutually exclusive"
+            )
         if self.stop_after_step is not None and not (
             0 < self.stop_after_step <= self.max_steps
         ):
@@ -221,9 +223,7 @@ class PromptEncoderCache:
         return value
 
     @torch.no_grad()
-    def encode_batch(
-        self, prompts: Sequence[str]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def encode_batch(self, prompts: Sequence[str]) -> tuple[torch.Tensor, torch.Tensor]:
         if not prompts:
             raise TrainerError("prompt micro-batch is empty")
         encoded = [self.encode(prompt) for prompt in prompts]
@@ -351,9 +351,7 @@ def _configure_groups(model: BuiltTrainingModel, phase: str) -> list[dict[str, o
     if model.is_geometry_only:
         pipeline = model.pipeline
         assert isinstance(pipeline, WorldCorePretrainingPipeline)
-        return configure_world_core_pretraining_parameter_groups(
-            pipeline.geometry_core
-        )
+        return configure_world_core_pretraining_parameter_groups(pipeline.geometry_core)
     pipeline = model.pipeline
     assert isinstance(pipeline, WM3DWAMTrainingPipeline)
     return configure_stage_parameter_groups(pipeline.system, TrainingStage(phase))
@@ -431,9 +429,7 @@ def _initialize_cross_phase(
     source = resolve_checkpoint(checkpoint)
     metadata = json.loads((source / "metadata.json").read_text(encoding="utf-8"))
     source_phase = str(metadata.get("phase", ""))
-    source_geometry_only = (
-        source_phase == TrainingStage.WORLD_CORE_PRETRAIN.value
-    )
+    source_geometry_only = source_phase == TrainingStage.WORLD_CORE_PRETRAIN.value
     if current_geometry_only and not source_geometry_only:
         raise TrainerError("a full Wan/Action checkpoint cannot initialize Stage A")
     if source_geometry_only and not current_geometry_only:
@@ -702,6 +698,8 @@ def train(
     )
     global_step = 0
     next_local_index = 0
+    resume_metadata: Mapping[str, Any] | None = None
+    resumed_checkpoint: Path | None = None
     if options.resume is not None:
         resumed = load_checkpoint(
             path_or_root=options.resume,
@@ -718,6 +716,8 @@ def train(
             raise TrainerError("resume phase_total_steps differs from this run")
         global_step = resumed.global_step
         next_local_index = resumed.next_local_sample_index
+        resume_metadata = resumed.metadata
+        resumed_checkpoint = resumed.checkpoint_path
     else:
         seed_everything(options.seed, rank_offset=True)
 
@@ -788,15 +788,57 @@ def train(
         "initialized_from_phase": (
             initialized_from.get("phase") if initialized_from is not None else None
         ),
+        "resumed_from": str(resumed_checkpoint)
+        if resumed_checkpoint is not None
+        else None,
+        "resume_global_step": global_step if resume_metadata is not None else None,
+        "resume_saved_world_size": (
+            int(resume_metadata["world_size"]) if resume_metadata is not None else None
+        ),
+        "resume_saved_effective_global_batch": (
+            int(resume_metadata["effective_global_batch"])
+            if resume_metadata is not None
+            and "effective_global_batch" in resume_metadata
+            else None
+        ),
+        "resume_resharded": (
+            int(resume_metadata["world_size"]) != context.world_size
+            if resume_metadata is not None
+            else False
+        ),
+        "resume_next_local_sample_index": (
+            next_local_index if resume_metadata is not None else None
+        ),
     }
     if context.is_main:
         run_path = output_dir / "run.json"
         if options.resume is None:
             if run_path.exists():
-                raise TrainerError(f"refusing to overwrite existing run metadata {run_path}")
+                raise TrainerError(
+                    f"refusing to overwrite existing run metadata {run_path}"
+                )
             _write_json(run_path, run_description)
-        elif not run_path.is_file():
-            raise TrainerError("resume output directory is missing run.json")
+        elif run_path.is_file():
+            existing = json.loads(run_path.read_text(encoding="utf-8"))
+            for name in (
+                "phase",
+                "phase_total_steps",
+                "seed",
+                "world_size",
+                "physical_cuda_devices",
+                "gradient_accumulation_steps",
+                "micro_batch_size",
+            ):
+                if existing.get(name) != run_description[name]:
+                    raise TrainerError(
+                        f"resume run metadata {name} mismatch: "
+                        f"saved={existing.get(name)!r}, runtime={run_description[name]!r}"
+                    )
+        else:
+            # A canonical Stage-A checkpoint may deliberately resume into a
+            # new output directory and a different device mesh. Preserve the
+            # source run and write an unambiguous continuation record here.
+            _write_json(run_path, run_description)
     distributed_barrier()
 
     metrics_path = output_dir / "metrics.jsonl"
@@ -845,11 +887,13 @@ def train(
                 scaled_loss.backward()
             for name, value in output.detached_metrics().items():
                 accumulated[name] = accumulated.get(name, 0.0) + float(value)
-            accumulated["loss_weighted"] = accumulated.get("loss_weighted", 0.0) + float(
-                weighted_loss.detach()
-            )
+            accumulated["loss_weighted"] = accumulated.get(
+                "loss_weighted", 0.0
+            ) + float(weighted_loss.detach())
             for request in sample.requests:
-                program_counts[request.program] = program_counts.get(request.program, 0) + 1
+                program_counts[request.program] = (
+                    program_counts.get(request.program, 0) + 1
+                )
                 source_counts[request.source] = source_counts.get(request.source, 0) + 1
             retry_count += sample.decode_retry_count
         grad_norm = _clip_grad_norm(wrapped, options.max_grad_norm)
@@ -876,11 +920,14 @@ def train(
                     / max(step_seconds, 1.0e-12)
                 ),
                 "decode_retries_per_step": float(retry_count),
-                "peak_memory_gib": torch.cuda.max_memory_allocated(context.device) / (1024**3),
+                "peak_memory_gib": torch.cuda.max_memory_allocated(context.device)
+                / (1024**3),
             }
         )
         reduced = reduce_metrics(local_metrics, device=context.device)
-        if context.is_main and (global_step == 1 or global_step % options.log_interval == 0):
+        if context.is_main and (
+            global_step == 1 or global_step % options.log_interval == 0
+        ):
             record: dict[str, object] = {
                 "kind": "train",
                 "step": global_step,
@@ -909,9 +956,15 @@ def train(
                 validation_seed=options.seed + 20_000,
             )
             if context.is_main:
-                record = {"kind": "validation", "step": global_step, **validation_metrics}
+                record = {
+                    "kind": "validation",
+                    "step": global_step,
+                    **validation_metrics,
+                }
                 _append_jsonl(metrics_path, record)
-                print(json.dumps(record, ensure_ascii=False, sort_keys=True), flush=True)
+                print(
+                    json.dumps(record, ensure_ascii=False, sort_keys=True), flush=True
+                )
 
         if (
             global_step % options.checkpoint_interval == 0
