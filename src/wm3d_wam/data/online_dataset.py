@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import random
 from typing import Any, Mapping
@@ -426,6 +427,16 @@ def collate_online_training_samples(
 
 def seed_online_worker(worker_id: int) -> None:
     del worker_id
+    # Training constructs the loader after the FSDP model and checkpoint have
+    # initialized CUDA. Workers must therefore be fresh spawned interpreters,
+    # never forked copies of a live CUDA process. Hide the devices inside the
+    # decode worker as an additional contract: all dataset tensors are CPU
+    # tensors and only the rank process may own a CUDA context.
+    if torch.cuda.is_initialized():
+        raise SourceContractError(
+            "online DataLoader worker inherited an initialized CUDA context"
+        )
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
     seed = int(torch.initial_seed() % (2**32))
     random.seed(seed)
     np.random.seed(seed)
@@ -464,6 +475,7 @@ def build_online_dataloader(
     if num_workers:
         kwargs.update(
             {
+                "multiprocessing_context": "spawn",
                 "persistent_workers": True,
                 "prefetch_factor": int(prefetch_factor),
                 "timeout": float(timeout_seconds),

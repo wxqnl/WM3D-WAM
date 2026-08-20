@@ -1,8 +1,17 @@
+import os
 from types import SimpleNamespace
 
+import pytest
+import torch
+
 from wm3d_wam.data.hierarchical_sampler import WindowRequest
-from wm3d_wam.data.online_dataset import OnlineRobotDataset
+from wm3d_wam.data.online_dataset import (
+    OnlineRobotDataset,
+    build_online_dataloader,
+    seed_online_worker,
+)
 from wm3d_wam.data.online_episode import OnlineEpisodeError
+from wm3d_wam.data.source_contracts import SourceContractError
 
 
 class _WindowStub:
@@ -11,6 +20,17 @@ class _WindowStub:
     episode_id = "source:retry-success"
     quality_weight = 1.0
     decode_retry_count = 1
+
+
+class _EmptySampler:
+    seed = 17
+    rank = 0
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self):
+        return 0
 
 
 def test_decode_retry_preserves_the_routed_target_view(monkeypatch) -> None:
@@ -62,3 +82,32 @@ def test_decode_retry_preserves_the_routed_target_view(monkeypatch) -> None:
     assert [call["target_view_fraction"] for call in calls] == [0.49, 0.49]
     assert calls[0]["anchor_fraction"] != calls[1]["anchor_fraction"]
     assert calls[0]["episode"] != calls[1]["episode"]
+
+
+def test_online_workers_use_a_fresh_spawn_context() -> None:
+    loader = build_online_dataloader(
+        [],
+        _EmptySampler(),
+        num_workers=2,
+        micro_batch_size=1,
+    )
+
+    assert loader.multiprocessing_context is not None
+    assert loader.multiprocessing_context.get_start_method() == "spawn"
+
+
+def test_online_worker_hides_cuda_devices(monkeypatch) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1,2,3,4")
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+
+    seed_online_worker(0)
+
+    assert not torch.cuda.is_initialized()
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == ""
+
+
+def test_online_worker_rejects_an_inherited_cuda_context(monkeypatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+
+    with pytest.raises(SourceContractError, match="inherited an initialized CUDA"):
+        seed_online_worker(0)
