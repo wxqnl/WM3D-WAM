@@ -563,7 +563,9 @@ def load_model_only(
         full_state_dict=True,
         cpu_offload=True,
         strict=True,
-        broadcast_from_rank0=True,
+        # Cross-phase distributed training needs rank-0 broadcast, while
+        # single-process evaluation deliberately has no process group.
+        broadcast_from_rank0=dist.is_available() and dist.is_initialized(),
     )
     model_state = get_model_state_dict(model, options=options)
     payload: dict[str, object] = {"model": model_state}

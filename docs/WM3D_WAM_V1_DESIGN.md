@@ -2,9 +2,10 @@
 
 版本：Revision 4
 
-日期：2026-08-20
+日期：2026-08-21
 
-状态：代码已实现，K=16 七卡 world-core canary 已通过
+状态：Stage A 四卡正式训练已完成；Stage B 四卡真实训练、验证与 checkpoint
+canary 已通过并开始正式训练
 
 ## 1. 设计结论
 
@@ -280,10 +281,10 @@ slot 不进入分母。
 
 | 阶段 | 步数 | 训练参数 | 默认 batch |
 |---|---:|---|---|
-| world_core_pretrain | 30,000 | WM3D core、history connector、reducer、VGGT pairs 4–23 | 4/GPU × 7，accum 1 |
-| wan_action_warmup | 2,000 | WM3D core、Action Expert、geometry adapters | 1/GPU × 7，accum 4 |
-| wan_action_main | 38,000 | 上述参数 + VGGT deep + Wan VideoDiT | 1/GPU × 7，accum 4 |
-| tri_stream_alignment | 20,000 | 与 main 相同，降低部分学习率 | 1/GPU × 7，accum 4 |
+| world_core_pretrain | 30,000 | WM3D core、history connector、reducer、VGGT pairs 4–23 | 4/GPU × 4，accum 1 |
+| wan_action_warmup | 2,000 | WM3D core、Action Expert、geometry adapters | 1/GPU × 4，accum 1 |
+| wan_action_main | 38,000 | 上述参数 + VGGT deep + Wan VideoDiT | 1/GPU × 4，accum 1 |
+| tri_stream_alignment | 20,000 | 与 main 相同，降低部分学习率 | 1/GPU × 4，accum 1 |
 
 VGGT shallow pairs、VGGT DPT heads、Wan VAE 和 UMT5 始终冻结。optimizer group
 必须完整覆盖所有 `requires_grad=True` 参数，重复归属或漏参会立即报错。
@@ -294,18 +295,18 @@ Wan/Action 阶段使用 rank-local FSDP shard，精确恢复要求相同 world s
 
 ## 11. batch 选择
 
-K=16 world-core 在七张 H100 80GB 上的真实一步结果：
+当前有序 mesh 固定为四张 H100 80GB（物理 1、2、3、4）。真实结果：
 
-| micro-batch/GPU | global batch | 结果 | 训练峰值 | 全局吞吐 |
-|---:|---:|---|---:|---:|
-| 1 | 7 | 通过 | 25.2 GiB | 0.476 sample/s |
-| 4 | 28 | 通过 | 48.7 GiB | 2.076 sample/s |
-| 6 | 42 | 通过，但驱动侧最高约 78.7GB | 64.3 GiB | 2.001 sample/s |
-| 8 | 56 | OOM，无 checkpoint | 超过 80GB | 无 |
+| phase | micro-batch/GPU | accum | global batch | 结果 | 训练峰值 |
+|---|---:|---:|---:|---|---:|
+| world-core | 4 | 1 | 16 | 正式训练 30,000 步完成 | 长期稳定 |
+| full Wan/Action | 1 | 1 | 4 | train、validation、rank-local checkpoint 通过 | 68.6 GiB |
+| full Wan/Action | 1 | 4 | 16 | backward OOM，无完整 checkpoint | 超过 80 GiB |
 
-正式配置使用 micro-batch 4、gradient accumulation 1。batch 6 没有足够的长期
-余量，batch 8 不可用。完整 Wan/Action 阶段的显存合同独立于 world-core，当前
-保持 micro-batch 1、accumulation 4，后续必须另做 K=16 七卡 canary。
+完整模型在 accumulation 4 时会同时保留 FP32 gradient shard 和下一轮
+full-parameter all-gather；失败 rank 还需申请约 11.29 GiB，但只剩约 3.48 GiB。
+因此当前正式配置固定为 micro-batch 1、accumulation 1。Stage B warmup、main 和
+Stage C 的 rank-local checkpoint 必须继续使用同一个有序四卡 mesh。
 
 ## 12. 推理接口
 
@@ -335,7 +336,8 @@ prior，避免把尚未完成的 noisy action 当事实动力学。联合采样�
 - 真实 DROID world-core forward/backward 和所有梯度 owner 通过；
 - 真实 RoboCasa action-only cache parity 与 future-target leakage delta 均为 0；
 - 单卡 forward-world 与 joint route 的 Wan、Action、VGGT、WM3D 梯度通过；
-- 七卡 FSDP batch 4 train、validation、canonical checkpoint 通过。
+- 四卡 world-core 正式训练完成，full-model train、validation 和 rank-local
+  checkpoint canary 通过。
 
 这些门禁证明 pipeline 可训练，不证明下游任务成功率。策略质量、长 rollout
 稳定性和 OOD 泛化必须在正式 checkpoint 上独立评测。

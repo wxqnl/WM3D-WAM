@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from contextlib import nullcontext
 from dataclasses import dataclass
 import json
 import math
@@ -867,24 +866,22 @@ def train(
                 context=context,
                 purpose="training",
             )
-            sync_context = (
-                wrapped.no_sync()
-                if micro_step + 1 < options.gradient_accumulation_steps
-                and hasattr(wrapped, "no_sync")
-                else nullcontext()
+            # FSDP ``no_sync`` retains full, unsharded gradients until the last
+            # micro-step. The 11B Stage-B graph then needs another ~11 GiB on
+            # the largest rank and cannot fit on an 80 GiB H100. Synchronizing
+            # each scaled micro-step preserves accumulated-gradient semantics
+            # while immediately reducing gradients back to shards.
+            output = _forward_sample(
+                wrapped,
+                sample=sample,
+                prompt_cache=prompt_cache,
+                device=context.device,
+                dtype=dtype,
+                gradient_checkpointing=True,
             )
-            with sync_context:
-                output = _forward_sample(
-                    wrapped,
-                    sample=sample,
-                    prompt_cache=prompt_cache,
-                    device=context.device,
-                    dtype=dtype,
-                    gradient_checkpointing=True,
-                )
-                weighted_loss = output.total_loss * sample.quality_weight
-                scaled_loss = weighted_loss / options.gradient_accumulation_steps
-                scaled_loss.backward()
+            weighted_loss = output.total_loss * sample.quality_weight
+            scaled_loss = weighted_loss / options.gradient_accumulation_steps
+            scaled_loss.backward()
             for name, value in output.detached_metrics().items():
                 accumulated[name] = accumulated.get(name, 0.0) + float(value)
             accumulated["loss_weighted"] = accumulated.get(

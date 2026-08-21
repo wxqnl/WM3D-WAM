@@ -6,6 +6,7 @@ import torch
 
 from wm3d_wam.data.hierarchical_sampler import WindowRequest
 from wm3d_wam.data.online_dataset import (
+    CompactEpisodeRecord,
     OnlineRobotDataset,
     build_online_dataloader,
     seed_online_worker,
@@ -33,6 +34,20 @@ class _EmptySampler:
         return 0
 
 
+def _compact_episode(episode_id: str) -> CompactEpisodeRecord:
+    return CompactEpisodeRecord(
+        source="source",
+        episode_id=episode_id,
+        task_text="move the object",
+        observation_samples=64,
+        payload="data/chunk/file.parquet",
+        payload_row_start=0,
+        payload_row_stop=64,
+        assets=(("rgb/head", "videos/head.mp4"),),
+        views=(("head", "rgb/head", 0.0, 6.4),),
+    )
+
+
 def test_decode_retry_preserves_the_routed_target_view(monkeypatch) -> None:
     dataset = object.__new__(OnlineRobotDataset)
     dataset.catalogs = {
@@ -41,8 +56,8 @@ def test_decode_retry_preserves_the_routed_target_view(monkeypatch) -> None:
             source_root="/unused",
             adapter_path="/unused/adapter.yaml",
             episodes=(
-                {"episode_id": "source:first"},
-                {"episode_id": "source:second"},
+                _compact_episode("source:first"),
+                _compact_episode("source:second"),
             ),
         )
     }

@@ -1,7 +1,8 @@
 # WM3D-WAM Revision 4 训练 Runbook
 
-更新日期：2026-08-20。所有命令在 New-H100-2 的
-`/data/Minko/WM3D-WAM` 执行。物理 GPU 0 保留，只使用 GPU 1–7。
+更新日期：2026-08-21。所有命令在 New-H100-2 的
+`/data/Minko/WM3D-WAM` 执行。当前完整训练 mesh 固定为物理 GPU 1–4；GPU
+0、5、6、7 均保留给其他任务。
 
 ## 1. 环境
 
@@ -20,7 +21,7 @@ export VGGT_SOURCE_ROOT=/data/Minko/world_model/wm3d_v8_action_experiments/gam_n
 export DATA_PROFILE=/data/Minko/wm3d_formal_1b_raw_100k_3f056a4_20260816/data_profile.yaml
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=1,2,3,4
 ```
 
 训练只从本地读取模型、Parquet 和 MP4。缺少资产或 checkpoint key 不匹配时立即
@@ -77,7 +78,7 @@ dynamics、在线 VGGT、Wan/Action MoT、interaction mask、sampler 和 checkpo
 ## 5. 分布式合同
 
 ```bash
-nvidia-smi -i 1,2,3,4,5,6,7 \
+nvidia-smi -i 1,2,3,4 \
   --query-gpu=index,memory.used,utilization.gpu \
   --format=csv
 ```
@@ -87,9 +88,11 @@ launcher 校验 `CUDA_VISIBLE_DEVICES`，拒绝 GPU 0、重复 ID、UUID 写法�
 `NCCL_NVLS_ENABLE=0`。TorchInductor 与 Triton 生成物写入
 `outputs/runtime_cache`，不占用空间紧张的根盘 `/tmp` 或 `/root`。
 
-K=16 world-core 的安全 batch 是每卡 4、累积 1、global batch 28。每卡 6 在
-canary 中接近显存上限，每卡 8 OOM。完整 Wan/Action 阶段仍使用每卡 1、累积 4；
-进入该阶段前需要重新做七卡 K=16 canary。
+K=16 world-core 的正式 batch 是每卡 4、累积 1、global batch 16。完整
+Wan/Action 的真实四卡 canary 使用每卡 1、累积 1、global batch 4，训练、验证和
+rank-local checkpoint 均通过，首步峰值约 68.6 GiB。累积 4 会在后续 micro-step
+同时保留 FP32 gradient shard 和新一轮 full-parameter all-gather，80 GiB H100
+实测 OOM，因此禁止用于当前四卡 mesh。
 
 ## 6. Checkpoint
 
@@ -112,7 +115,7 @@ checkpoint 保存 model、optimizer、scheduler、各 rank RNG 和已提交 samp
 ### 7.1 Stage A：WM3D world core，30,000 步
 
 ```bash
-"$WM3D_TORCHRUN" --standalone --nproc_per_node=7 \
+"$WM3D_TORCHRUN" --standalone --nproc_per_node=4 \
   scripts/train_wm3d_wam.py \
   --phase world_core_pretrain \
   --max-steps 30000 \
@@ -123,9 +126,9 @@ checkpoint 保存 model、optimizer、scheduler、各 rank RNG 和已提交 samp
   --log-interval 10 \
   --validation-interval 500 \
   --validation-samples-per-rank 8 \
-  --checkpoint-interval 1000 \
-  --keep-last-checkpoints 2 \
-  --output-dir outputs/train/wm3d_wam_k16_r4/stage_a_world_core
+  --checkpoint-interval 500 \
+  --keep-last-checkpoints 3 \
+  --output-dir outputs/train/wm3d_wam_k16_r4/stage_a_world_core_gpu1_4
 ```
 
 这个阶段不加载 Wan 或 ActionDiT。optimizer 只包含 WM3D state dynamics、history
@@ -134,21 +137,21 @@ connector、geometry reducer 和 VGGT deep pairs 4–23。
 ### 7.2 Stage B warmup，2,000 步
 
 ```bash
-"$WM3D_TORCHRUN" --standalone --nproc_per_node=7 \
+"$WM3D_TORCHRUN" --standalone --nproc_per_node=4 \
   scripts/train_wm3d_wam.py \
   --phase wan_action_warmup \
   --max-steps 2000 \
   --micro-batch-size 1 \
-  --gradient-accumulation-steps 4 \
+  --gradient-accumulation-steps 1 \
   --num-workers 4 \
   --warmup-steps 200 \
   --log-interval 10 \
   --validation-interval 500 \
   --validation-samples-per-rank 8 \
-  --checkpoint-interval 1000 \
-  --keep-last-checkpoints 2 \
-  --initialize-from outputs/train/wm3d_wam_k16_r4/stage_a_world_core/checkpoints \
-  --output-dir outputs/train/wm3d_wam_k16_r4/stage_b_warmup
+  --checkpoint-interval 500 \
+  --keep-last-checkpoints 3 \
+  --initialize-from outputs/train/wm3d_wam_k16_r4/stage_a_world_core_gpu1_4/checkpoints/step_00030000 \
+  --output-dir outputs/train/wm3d_wam_k16_r4/stage_b_warmup_gpu1_4
 ```
 
 warmup 训练 WM3D core、Action Expert 和 geometry adapters；Wan VideoDiT 与 VGGT
@@ -157,21 +160,21 @@ deep 暂时冻结。
 ### 7.3 Stage B main，38,000 步
 
 ```bash
-"$WM3D_TORCHRUN" --standalone --nproc_per_node=7 \
+"$WM3D_TORCHRUN" --standalone --nproc_per_node=4 \
   scripts/train_wm3d_wam.py \
   --phase wan_action_main \
   --max-steps 38000 \
   --micro-batch-size 1 \
-  --gradient-accumulation-steps 4 \
+  --gradient-accumulation-steps 1 \
   --num-workers 4 \
   --warmup-steps 500 \
   --log-interval 10 \
   --validation-interval 500 \
   --validation-samples-per-rank 8 \
-  --checkpoint-interval 5000 \
-  --keep-last-checkpoints 2 \
-  --initialize-from outputs/train/wm3d_wam_k16_r4/stage_b_warmup/checkpoints \
-  --output-dir outputs/train/wm3d_wam_k16_r4/stage_b_main
+  --checkpoint-interval 500 \
+  --keep-last-checkpoints 3 \
+  --initialize-from outputs/train/wm3d_wam_k16_r4/stage_b_warmup_gpu1_4/checkpoints \
+  --output-dir outputs/train/wm3d_wam_k16_r4/stage_b_main_gpu1_4
 ```
 
 main 解冻 Wan VideoDiT 和 VGGT deep，继续训练 Action Expert、WM3D core 与
@@ -180,24 +183,24 @@ geometry adapters。
 ### 7.4 Stage C：tri-stream alignment，20,000 步
 
 ```bash
-"$WM3D_TORCHRUN" --standalone --nproc_per_node=7 \
+"$WM3D_TORCHRUN" --standalone --nproc_per_node=4 \
   scripts/train_wm3d_wam.py \
   --phase tri_stream_alignment \
   --max-steps 20000 \
   --micro-batch-size 1 \
-  --gradient-accumulation-steps 4 \
+  --gradient-accumulation-steps 1 \
   --num-workers 4 \
   --warmup-steps 500 \
   --log-interval 10 \
   --validation-interval 500 \
   --validation-samples-per-rank 8 \
-  --checkpoint-interval 5000 \
-  --keep-last-checkpoints 2 \
-  --initialize-from outputs/train/wm3d_wam_k16_r4/stage_b_main/checkpoints \
-  --output-dir outputs/train/wm3d_wam_k16_r4/stage_c_tri_stream
+  --checkpoint-interval 500 \
+  --keep-last-checkpoints 3 \
+  --initialize-from outputs/train/wm3d_wam_k16_r4/stage_b_main_gpu1_4/checkpoints \
+  --output-dir outputs/train/wm3d_wam_k16_r4/stage_c_tri_stream_gpu1_4
 ```
 
-Stage B warmup、main 和 Stage C 必须保持相同的有序七卡 mesh。学习率和参数归属
+Stage B warmup、main 和 Stage C 必须保持相同的有序四卡 mesh（物理 1、2、3、4）。学习率和参数归属
 由 `src/wm3d_wam/training/parameter_groups.py` 决定，CLI 不提供临时覆盖。
 
 ## 8. 精确恢复
@@ -206,7 +209,7 @@ Stage B warmup、main 和 Stage C 必须保持相同的有序七卡 mesh。学�
 目录和 GPU mesh，将初始化参数改为 `--resume`：
 
 ```bash
-"$WM3D_TORCHRUN" --standalone --nproc_per_node=7 \
+"$WM3D_TORCHRUN" --standalone --nproc_per_node=4 \
   scripts/train_wm3d_wam.py \
   --phase world_core_pretrain \
   --max-steps 30000 \
@@ -217,10 +220,10 @@ Stage B warmup、main 和 Stage C 必须保持相同的有序七卡 mesh。学�
   --log-interval 10 \
   --validation-interval 500 \
   --validation-samples-per-rank 8 \
-  --checkpoint-interval 1000 \
-  --keep-last-checkpoints 2 \
-  --resume outputs/train/wm3d_wam_k16_r4/stage_a_world_core/checkpoints \
-  --output-dir outputs/train/wm3d_wam_k16_r4/stage_a_world_core
+  --checkpoint-interval 500 \
+  --keep-last-checkpoints 3 \
+  --resume outputs/train/wm3d_wam_k16_r4/stage_a_world_core_gpu1_4/checkpoints \
+  --output-dir outputs/train/wm3d_wam_k16_r4/stage_a_world_core_gpu1_4
 ```
 
 `--stop-after-step N` 在 phase-local step N 验证、保存完整 checkpoint，并写

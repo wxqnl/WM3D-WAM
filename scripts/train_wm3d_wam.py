@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import os
 from pathlib import Path
+import signal
 
 # Whole-MoT FSDP briefly allocates and releases multi-GiB unsharded buffers.
 # Expandable segments prevent those variable-size collectives from stranding
@@ -26,19 +28,29 @@ os.environ.setdefault(
     str(_COMPILER_CACHE_ROOT / "triton"),
 )
 
-from wm3d_wam.training.distributed import (  # noqa: E402
-    initialize_distributed,
-    shutdown_distributed,
-)
-from wm3d_wam.training.trainer import (  # noqa: E402
-    PHASES,
-    TrainerOptions,
-    TrainingPaths,
-    train,
-)
-
 
 def main() -> None:
+    # Keep a production-safe stack-dump hook available for distributed hangs.
+    # SIGUSR1 only writes Python stacks to the existing training log; it does
+    # not interrupt the rank or mutate training state.
+    faulthandler.enable(all_threads=True)
+    if hasattr(signal, "SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+
+    # A spawned DataLoader worker imports this launcher as ``__mp_main__``.
+    # Keep the full model/trainer import inside the real entry point so decode
+    # workers do not initialize the 11B model stack or an Inductor worker pool.
+    from wm3d_wam.training.distributed import (
+        initialize_distributed,
+        shutdown_distributed,
+    )
+    from wm3d_wam.training.trainer import (
+        PHASES,
+        TrainerOptions,
+        TrainingPaths,
+        train,
+    )
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--phase", required=True, choices=PHASES)
     parser.add_argument("--max-steps", type=int, required=True)

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import random
+import sys
 from typing import Any, Mapping
 
 import numpy as np
@@ -32,6 +33,84 @@ from .source_contracts import (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class CompactEpisodeRecord:
+    """Manifest fields required to decode one training window.
+
+    Full audited manifest rows also contain clocks, hashes, robot-group
+    summaries, and split metadata. Keeping those nested dictionaries in the
+    Dataset made ``spawn`` serialize several GiB into every worker. This
+    record retains the exact paths, slices, views, and task metadata consumed
+    by ``load_online_robot_window`` while the full manifests remain the source
+    used for eligibility checks.
+    """
+
+    source: str
+    episode_id: str
+    task_text: str
+    observation_samples: int
+    payload: str
+    payload_row_start: int
+    payload_row_stop: int
+    assets: tuple[tuple[str, str], ...]
+    views: tuple[tuple[str, str, float, float], ...]
+
+    @classmethod
+    def from_manifest(cls, record: Mapping[str, Any]) -> "CompactEpisodeRecord":
+        assets = record.get("assets")
+        views = record.get("views")
+        if not isinstance(assets, list) or not isinstance(views, list):
+            raise SourceContractError("eligible manifest row has invalid assets/views")
+        return cls(
+            source=sys.intern(str(record["source"])),
+            episode_id=str(record["episode_id"]),
+            task_text=sys.intern(str(record.get("task_text", ""))),
+            observation_samples=int(record["observation_samples"]),
+            payload=sys.intern(str(record["payload"])),
+            payload_row_start=int(record["payload_row_start"]),
+            payload_row_stop=int(record["payload_row_stop"]),
+            assets=tuple(
+                (
+                    sys.intern(str(item["role"])),
+                    sys.intern(str(item["path"])),
+                )
+                for item in assets
+            ),
+            views=tuple(
+                (
+                    sys.intern(str(item["name"])),
+                    sys.intern(str(item["asset_role"])),
+                    float(item["start_s"]),
+                    float(item["stop_s"]),
+                )
+                for item in views
+            ),
+        )
+
+    def materialize(self) -> dict[str, Any]:
+        """Recreate the minimal mapping accepted by the raw-data decoder."""
+
+        return {
+            "source": self.source,
+            "episode_id": self.episode_id,
+            "task_text": self.task_text,
+            "observation_samples": self.observation_samples,
+            "payload": self.payload,
+            "payload_row_start": self.payload_row_start,
+            "payload_row_stop": self.payload_row_stop,
+            "assets": [{"role": role, "path": path} for role, path in self.assets],
+            "views": [
+                {
+                    "name": name,
+                    "asset_role": asset_role,
+                    "start_s": start_s,
+                    "stop_s": stop_s,
+                }
+                for name, asset_role, start_s, stop_s in self.views
+            ],
+        }
+
+
 @dataclass(frozen=True)
 class SourceEpisodeCatalog:
     contract: SourceContract
@@ -39,7 +118,7 @@ class SourceEpisodeCatalog:
     adapter_path: Path
     manifest_path: Path
     profile_weight: float
-    episodes: tuple[dict[str, Any], ...]
+    episodes: tuple[CompactEpisodeRecord, ...]
 
 
 @dataclass(frozen=True)
@@ -152,12 +231,12 @@ class OnlineRobotDataset(Dataset[OnlineTrainingSample]):
             ids = _load_split_ids(split_root / split / f"{source}.txt")
             manifest_path = Path(str(row["manifest"])).expanduser().resolve(strict=True)
             episodes = tuple(
-                record
+                CompactEpisodeRecord.from_manifest(record)
                 for record in iter_episode_manifest(manifest_path)
                 if str(record.get("episode_id", "")) in ids
                 and is_v1_eligible_manifest_record(record)
             )
-            found = {str(record["episode_id"]) for record in episodes}
+            found = {record.episode_id for record in episodes}
             if found != ids:
                 missing = sorted(ids - found)
                 raise SourceContractError(
@@ -225,7 +304,8 @@ class OnlineRobotDataset(Dataset[OnlineTrainingSample]):
             episode_index = (
                 request.episode_index + retry * request.retry_stride
             ) % episode_count
-            episode = catalog.episodes[episode_index]
+            episode_record = catalog.episodes[episode_index]
+            episode = episode_record.materialize()
             anchor_fraction = (
                 request.anchor_fraction + retry * 0.6180339887498949
             ) % 1.0
@@ -261,7 +341,7 @@ class OnlineRobotDataset(Dataset[OnlineTrainingSample]):
                 )
             except (OnlineEpisodeError, OSError) as exc:
                 errors.append(
-                    f"{episode.get('episode_id', '<unknown>')}: {type(exc).__name__}: {exc}"
+                    f"{episode_record.episode_id}: {type(exc).__name__}: {exc}"
                 )
         raise OnlineEpisodeError(
             f"failed {self.max_decode_retries} deterministic windows for "
