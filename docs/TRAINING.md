@@ -94,6 +94,13 @@ rank-local checkpoint 均通过，首步峰值约 68.6 GiB。累积 4 会在后�
 同时保留 FP32 gradient shard 和新一轮 full-parameter all-gather，80 GiB H100
 实测 OOM，因此禁止用于当前四卡 mesh。
 
+冻结的 UMT5 只在 prompt cache miss 时临时进入对应 rank 的 GPU。文本特征产生后，
+encoder 必须立即回到 CPU，并在 FSDP forward/backward 前释放 CUDA allocator cache。
+UMT5 不参与 optimizer 或训练图；若让其约 11 GiB 的 BF16 权重常驻，每卡可用空间
+不足以承载解冻 Wan VideoDiT 后约 11.3 GiB 的 FSDP full-parameter all-gather。
+cache miss step 会包含一次 CPU/GPU 权重搬运，命中已有 prompt 时不再搬运或重新
+编码。
+
 ## 6. Checkpoint
 
 | phase | 格式 | 恢复条件 |
@@ -179,6 +186,10 @@ deep 暂时冻结。
 
 main 解冻 Wan VideoDiT 和 VGGT deep，继续训练 Action Expert、WM3D core 与
 geometry adapters。
+
+四卡 main canary 必须至少覆盖 `forward_world`、`joint_world_action` 和
+`action_only`，并通过一次完整 rank-local checkpoint；仅成功构建模型不算通过
+显存门禁。
 
 ### 7.4 Stage C：tri-stream alignment，20,000 步
 

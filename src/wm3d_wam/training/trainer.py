@@ -209,12 +209,24 @@ class PromptEncoderCache:
         if cached is not None:
             self.cache[key] = cached
             return cached
-        context, mask = encode_local_wan_prompts(
-            self.components,
-            [key],
-            device=self.device,
-            dtype=self.dtype,
-        )
+        encoder = self.components.text_encoder
+        # UMT5 is frozen and its output is detached. Keeping its ~11 GiB of
+        # BF16 weights resident after a cache miss leaves too little room for
+        # the trainable Wan VideoDiT full-parameter all-gather in backward.
+        # Move it onto the rank GPU only for no-grad prompt encoding, then
+        # return it to CPU before the FSDP training graph starts.
+        encoder.to(device=self.device)
+        try:
+            context, mask = encode_local_wan_prompts(
+                self.components,
+                [key],
+                device=self.device,
+                dtype=self.dtype,
+            )
+        finally:
+            encoder.to(device=torch.device("cpu"))
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
         value = (context.detach(), mask.detach())
         self.cache[key] = value
         while len(self.cache) > self.max_entries:
