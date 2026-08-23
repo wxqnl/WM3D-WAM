@@ -198,6 +198,19 @@ geometry adapters。默认 route mix 为 `forward_world=0.65`、`action_only=0.2
 `action_only` 的视频/VGGT conditioner 在 no-grad 区域构建；`joint_world_action`
 只允许 video→action，不允许视频读取 noisy action。
 
+### 7.4 Stage A → Stage B 无缝交接
+
+正式连续训练可在 Stage A 运行期间启动交接器：
+
+```bash
+nohup bash scripts/ops/run_r5_stage_handoff.sh \
+  > outputs/train/wm3d_wam_k16_r5/r5_stage_handoff.log 2>&1 < /dev/null &
+```
+
+交接器只接受完整且元数据匹配的 Stage A `step_00030000` 和 Stage B warmup
+`step_00002000`。它等待前一阶段所有 rank 退出后再启动下一阶段，不覆盖已有
+output 或正式日志；异常恢复仍必须从对应阶段最新完整 checkpoint exact resume。
+
 单卡 full-pipeline canary 必须分别覆盖 `forward_world`、
 `joint_world_action` 和 `action_only` 的真实 forward/backward 与梯度归属；四卡 main
 canary 还必须完成真实 FSDP optimizer step 和完整 rank-local checkpoint。仅成功构建
