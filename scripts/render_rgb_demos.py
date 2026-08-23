@@ -443,6 +443,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--inference-steps", type=int, default=30)
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--candidate-windows", type=int, default=4)
+    parser.add_argument("--physical-gpu", type=int, default=7)
     parser.add_argument("--seed", type=int, default=20260822)
     parser.add_argument(
         "--data-profile",
@@ -655,8 +656,8 @@ def _build_model(
 def main() -> None:
     args = _parse_args()
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").replace(" ", "")
-    if visible != "7":
-        raise RuntimeError("RGB demo must run with CUDA_VISIBLE_DEVICES=7")
+    if visible != str(args.physical_gpu):
+        raise RuntimeError("--physical-gpu must match CUDA_VISIBLE_DEVICES")
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise RuntimeError("RGB demo requires exactly one visible CUDA device")
     device = torch.device("cuda:0")
@@ -754,7 +755,7 @@ def main() -> None:
         "checkpoint": str(checkpoint),
         "checkpoint_step": int(checkpoint_metadata["global_step"]),
         "checkpoint_restore": dict(restore_stats),
-        "physical_gpu": 7,
+        "physical_gpu": int(args.physical_gpu),
         "split": "val",
         "program": InteractionProgram.FORWARD_WORLD.value,
         "future_target_access_during_generation": False,
