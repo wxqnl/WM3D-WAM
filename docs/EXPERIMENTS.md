@@ -1,4 +1,4 @@
-# WM3D-WAM Revision 4 前期实验
+# WM3D-WAM Revision 4–5 前期实验
 
 更新日期：2026-08-20。机器为 New-H100-2，GPU 为 H100 80GB。实验使用生产宽度
 模型、本地正式权重、真实 Parquet/MP4 和在线 VGGT。没有缩小 hidden/layer、使用
@@ -174,3 +174,60 @@ loss 不是只在 frozen teacher 上计算。
 这些实验没有证明策略成功率、长 rollout 稳定性或相对 baseline 收益。进入
 Wan/Action 阶段前仍需执行新架构的七卡完整模型 canary；旧 Geometry-GAM 的多卡
 结果不能替代它。
+
+## 8. Revision 5 运动条件修复
+
+Revision 4 的 RGB demo 出现明显静态偏置。对 active graph 与 FastWAM/Worldscape
+数据合同逐项对照后，发现不是单纯“训练步数不够”，而是三个可复现的结构问题：
+
+1. grouped action/state codec 在 set pooling 前把 value encoding 与 field metadata
+   直接相加。交换 x/y 或两个关节的数值后，求和完全相同；实测 token 最大变化仅约
+   `1.19e-7`，模型无法识别“哪个值属于哪个轴/关节”。
+2. `forward_world` 允许所有 future video token 读取所有 action event，丢失 16 个
+   物理时间 bin 与四个 future Wan latent group 的因果对应。
+3. joint route 让 RGB 读取尚在 flow noise 中的 action；action-only loss 还会反传到
+   Wan/geometry。两者都偏离成熟 FastWAM 的 video→action joint 路径，并稀释 clean
+   action-conditioned RGB 更新。
+
+修复内容：
+
+- 使用非线性 `phi(value, field)` 后再 masked pooling，恢复 field/value 绑定；
+- 根据真实 `step_indices` 构造 16→4 group-diagonal action mask，对齐 FastWAM 正式
+  配置且不假设各 source 的 event 数量相同；
+- joint 改为 video→action，action-only conditioner 完全 detached；
+- Stage B route mix 改为 65% `forward_world`、25% `action_only`、10% joint。
+
+### 8.1 自动与单卡真实门禁
+
+完整测试为 75 项全部通过。真实单卡 full-pipeline preflight 使用在线 VGGT、Wan
+VAE/VideoDiT、Grouped ActionDiT 和实际机器人窗口：
+
+| route | 结果 | peak memory |
+|---|---|---:|
+| forward_world | final group-diagonal mask 下 total loss 2.7550；所有预期梯度 finite | 33.57 GiB |
+| action_only | total loss 2.2973；Action Expert 848 个 grad tensor；其余 owner 0；cache/leakage delta 0 | 21.26 GiB |
+| joint_world_action | total loss 4.5236；action/video/world 预期梯度 finite | 31.16 GiB |
+
+### 8.2 四卡真实 FSDP 门禁
+
+物理 GPU 1–4 上执行，未使用 GPU 0/5/6/7：
+
+| canary | optimizer steps | checkpoint | peak memory |
+|---|---:|---|---:|
+| Stage A world core | 2 | canonical DCP 完整 | 40.79 GiB |
+| Stage B main（final group-diagonal） | 1 `forward_world` | model/optimizer/runtime rank 000–003 完整 | 68.53 GiB |
+
+此前三步 full-model canary 已覆盖两个 `forward_world` 和一个 `action_only`；最终
+group-diagonal mask 另行重跑了一个真实 `forward_world` optimizer step。两次的
+loss、grad norm 均 finite，无 OOM、NCCL、DataLoader、NaN 或临时 checkpoint
+文件。joint 由同一 full model 的单卡真实 backward 覆盖。
+
+因为 codec 参数空间与 attention 语义已经改变，Revision 4 的 Stage A 30k 和
+Stage B 14k checkpoint 均不能继续使用。正式 Revision 5 必须从基础权重重新训练。
+
+另外从正式 sampler 独立抽取 120 个真实 `forward_world` train window：相邻帧 RGB
+L1 均值为 0.02455，中位数为 0.01969，只有 7.5% 低于 0.005；末帧相对 anchor
+L1 均值为 0.10251。各来源均存在显著运动。因此静态偏置不能归因于训练集主要由
+静止片段构成，也暂不引入会改变数据分布的 motion oversampling。RGB renderer 新增
+预测/真值 motion ratio、静态 anchor baseline，以及保持 action value multiset 的
+field-swap velocity sensitivity 指标。

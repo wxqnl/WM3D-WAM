@@ -45,9 +45,9 @@ from wm3d_wam.training.trainer import (  # noqa: E402
 )
 
 
-DEFAULT_STAGE_A = Path("outputs/train/wm3d_wam_k16_r4/stage_a_world_core_gpu1_4")
+DEFAULT_STAGE_A = Path("outputs/train/wm3d_wam_k16_r5/stage_a_world_core_gpu1_4")
 DEFAULT_CHECKPOINT = DEFAULT_STAGE_A / "checkpoints/step_00030000"
-DEFAULT_OUTPUT = Path("outputs/eval/world_core_step_00030000")
+DEFAULT_OUTPUT = Path("outputs/eval/world_core_r5_step_00030000")
 DEFAULT_SOURCES = ("oxe_bc_z", "oxe_bridge", "robocasa_composite")
 ANCHOR_SECONDS = (0.4, 0.8, 1.2, 1.6)
 

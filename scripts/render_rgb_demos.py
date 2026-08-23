@@ -32,6 +32,7 @@ import numpy as np  # noqa: E402
 from PIL import Image, ImageDraw, ImageFont  # noqa: E402
 import torch  # noqa: E402
 
+from wm3d_wam.data.action_events import GroupedActionBatch  # noqa: E402
 from wm3d_wam.data.hierarchical_sampler import WindowRequest  # noqa: E402
 from wm3d_wam.data.online_dataset import (  # noqa: E402
     OnlineRobotDataset,
@@ -57,7 +58,7 @@ from wm3d_wam.vendor.fastwam.wan22.schedulers.scheduler_continuous import (  # n
 
 
 DEFAULT_CHECKPOINT = Path(
-    "outputs/train/wm3d_wam_k16_r4/stage_b_main_gpu1_4/checkpoints/step_00006000"
+    "outputs/train/wm3d_wam_k16_r5/stage_b_main_gpu1_4/checkpoints"
 )
 DEFAULT_SOURCES = (
     "oxe_droid",
@@ -166,6 +167,36 @@ def _unbatched_video(video: torch.Tensor) -> torch.Tensor:
     return video
 
 
+def _field_swapped_actions(batch: GroupedActionBatch) -> GroupedActionBatch:
+    """Preserve every event's value multiset while changing field assignment."""
+
+    values = batch.values.clone()
+    flat_values = values.flatten(2)
+    valid = (
+        batch.value_mask.bool()
+        & batch.event_mask[:, :, None, None].bool()
+        & batch.group_mask[:, None, :, None].bool()
+    ).flatten(2)
+    for batch_index in range(flat_values.shape[0]):
+        for event_index in range(flat_values.shape[1]):
+            indices = torch.nonzero(
+                valid[batch_index, event_index], as_tuple=False
+            ).flatten()
+            if indices.numel() < 2:
+                continue
+            event_values = flat_values[batch_index, event_index, indices]
+            different = torch.nonzero(
+                event_values != event_values[0], as_tuple=False
+            ).flatten()
+            if not different.numel():
+                continue
+            first, second = indices[0], indices[different[0]]
+            saved = flat_values[batch_index, event_index, first].clone()
+            flat_values[batch_index, event_index, first] = flat_values[batch_index, event_index, second]
+            flat_values[batch_index, event_index, second] = saved
+    return batch.with_values(values)
+
+
 def _sample_video(
     *,
     system: WM3DWAMSystem,
@@ -199,6 +230,8 @@ def _sample_video(
     timesteps, deltas = scheduler.build_inference_schedule(
         steps, device=device, dtype=dtype
     )
+    action_field_swap_velocity_l1 = float("nan")
+    action_field_swap_velocity_relative_l1 = float("nan")
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize(device)
     started = time.monotonic()
@@ -226,6 +259,50 @@ def _sample_video(
             velocity = output.mot.video_velocity
             if velocity is None or velocity.shape != latents.shape:
                 raise RuntimeError("forward_world returned invalid video velocity")
+            if index == 1:
+                swapped_actions = _field_swapped_actions(window.future_actions)
+                if torch.equal(swapped_actions.values, window.future_actions.values):
+                    raise RuntimeError(
+                        "RGB action-sensitivity audit could not swap two valid fields"
+                    )
+                geometry_tokens = output.geometry.geometry_tokens
+                geometry_token_mask = output.geometry.geometry_token_mask
+                del output
+                with torch.autocast("cuda", dtype=dtype):
+                    swapped_output = system.wan_action(
+                        program=InteractionProgram.FORWARD_WORLD,
+                        video_latents=latents,
+                        video_timestep=batch_timestep,
+                        action_batch=swapped_actions,
+                        action_timestep=action_timestep,
+                        context=context,
+                        context_mask=context_mask,
+                        action_step_indices=window.future_action_history.step_indices,
+                        num_action_steps=window.future_action_history.num_steps,
+                        geometry_tokens=geometry_tokens,
+                        geometry_token_mask=geometry_token_mask,
+                    )
+                swapped_velocity = swapped_output.video_velocity
+                if swapped_velocity is None:
+                    raise RuntimeError("field-swapped forward_world returned no video")
+                future_velocity = velocity[:, :, 1:].float()
+                field_delta = (
+                    future_velocity - swapped_velocity[:, :, 1:].float()
+                ).abs().mean()
+                action_field_swap_velocity_l1 = float(field_delta.item())
+                action_field_swap_velocity_relative_l1 = float(
+                    (field_delta / future_velocity.abs().mean().clamp_min(1.0e-8)).item()
+                )
+                del (
+                    swapped_actions,
+                    swapped_output,
+                    swapped_velocity,
+                    future_velocity,
+                    geometry_tokens,
+                    geometry_token_mask,
+                )
+            else:
+                del output
             latents = scheduler.step(velocity, delta, latents)
             latents[:, :, 0].copy_(anchor_latents[:, :, 0])
             if index == 1 or index == steps or index % 5 == 0:
@@ -244,7 +321,7 @@ def _sample_video(
                 )
     torch.cuda.synchronize(device)
     denoise_seconds = time.monotonic() - started
-    del output, velocity
+    del velocity
     torch.cuda.empty_cache()
     with torch.no_grad(), torch.autocast("cuda", dtype=dtype):
         decoded = system.video_vae.decode(latents, device=device)
@@ -255,6 +332,10 @@ def _sample_video(
         "denoise_seconds": float(denoise_seconds),
         "total_generation_seconds": float(total_seconds),
         "peak_memory_gib": float(torch.cuda.max_memory_allocated(device) / 2**30),
+        "action_field_swap_velocity_l1": action_field_swap_velocity_l1,
+        "action_field_swap_velocity_relative_l1": (
+            action_field_swap_velocity_relative_l1
+        ),
     }
 
 
@@ -279,14 +360,35 @@ def _rgb_metrics(
     per_frame = (predicted[:, 1:] - reference[:, 1:]).square().mean((0, 2, 3))
     if bool(valid_future.any()):
         future_mse = float(per_frame[valid_future].mean().item())
+        static_per_frame = (
+            reference[:, :1] - reference[:, 1:]
+        ).square().mean((0, 2, 3))
+        static_future_mse = float(static_per_frame[valid_future].mean().item())
     else:
         future_mse = float("nan")
+        static_future_mse = float("nan")
+    predicted_motion = float(
+        (predicted[:, 1:] - predicted[:, :-1]).abs().mean().item()
+    )
+    reference_motion = float(
+        (reference[:, 1:] - reference[:, :-1]).abs().mean().item()
+    )
     return {
         "anchor_vae_mse": anchor_mse,
         "anchor_vae_psnr_db": float(-10.0 * math.log10(max(anchor_mse, 1.0e-12))),
         "valid_future_frames": int(valid_future.sum().item()),
         "future_mse": future_mse,
         "future_psnr_db": float(-10.0 * math.log10(max(future_mse, 1.0e-12))),
+        "static_anchor_future_mse": static_future_mse,
+        "future_mse_gain_over_static": static_future_mse - future_mse,
+        "predicted_adjacent_motion_l1": predicted_motion,
+        "reference_adjacent_motion_l1": reference_motion,
+        "predicted_to_reference_motion_ratio": float(
+            predicted_motion / max(reference_motion, 1.0e-8)
+        ),
+        "predicted_final_anchor_l1": float(
+            (predicted[:, -1] - predicted[:, 0]).abs().mean().item()
+        ),
     }
 
 

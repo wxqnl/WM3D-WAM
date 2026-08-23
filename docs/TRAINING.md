@@ -1,6 +1,6 @@
-# WM3D-WAM Revision 4 训练 Runbook
+# WM3D-WAM Revision 5 训练 Runbook
 
-更新日期：2026-08-21。所有命令在 New-H100-2 的
+更新日期：2026-08-23。所有命令在 New-H100-2 的
 `/data/Minko/WM3D-WAM` 执行。当前完整训练 mesh 固定为物理 GPU 1–4；GPU
 0、5、6、7 均保留给其他任务。
 
@@ -112,8 +112,13 @@ checkpoint 保存 model、optimizer、scheduler、各 rank RNG 和已提交 samp
 完成目录最后写 `metadata.json`，随后原子更新 `latest.txt`。`--keep-last-checkpoints`
 只清理更老且带合法完成标记的 checkpoint。
 
-旧 `stage_a_geometry` 或 `geometry_gam` checkpoint 不包含新的 WM3D state core，
-不能 resume Revision 4。
+Revision 5 修复了 grouped state/action codec 的字段—数值绑定，并改变了 MoT 的
+跨流 attention 合同。Revision 4 的 Stage A/B checkpoint 虽然文件完整，但参数空间
+和训练语义都已过期，不能 resume 或作为后续阶段初始化点。Revision 5 必须从官方
+VGGT/Wan/FastWAM 基础权重重新训练 Stage A；旧输出只保留作审计证据。
+
+`stage_a_geometry`、`geometry_gam` 和更早 checkpoint 同样不包含当前 WM3D state
+core，不能用于 Revision 5。
 
 ## 7. 正式训练
 
@@ -135,7 +140,7 @@ checkpoint 保存 model、optimizer、scheduler、各 rank RNG 和已提交 samp
   --validation-samples-per-rank 8 \
   --checkpoint-interval 500 \
   --keep-last-checkpoints 3 \
-  --output-dir outputs/train/wm3d_wam_k16_r4/stage_a_world_core_gpu1_4
+  --output-dir outputs/train/wm3d_wam_k16_r5/stage_a_world_core_gpu1_4
 ```
 
 这个阶段不加载 Wan 或 ActionDiT。optimizer 只包含 WM3D state dynamics、history
@@ -157,8 +162,8 @@ connector、geometry reducer 和 VGGT deep pairs 4–23。
   --validation-samples-per-rank 8 \
   --checkpoint-interval 500 \
   --keep-last-checkpoints 3 \
-  --initialize-from outputs/train/wm3d_wam_k16_r4/stage_a_world_core_gpu1_4/checkpoints/step_00030000 \
-  --output-dir outputs/train/wm3d_wam_k16_r4/stage_b_warmup_gpu1_4
+  --initialize-from outputs/train/wm3d_wam_k16_r5/stage_a_world_core_gpu1_4/checkpoints/step_00030000 \
+  --output-dir outputs/train/wm3d_wam_k16_r5/stage_b_warmup_gpu1_4
 ```
 
 warmup 训练 WM3D core、Action Expert 和 geometry adapters；Wan VideoDiT 与 VGGT
@@ -180,16 +185,20 @@ deep 暂时冻结。
   --validation-samples-per-rank 8 \
   --checkpoint-interval 500 \
   --keep-last-checkpoints 3 \
-  --initialize-from outputs/train/wm3d_wam_k16_r4/stage_b_warmup_gpu1_4/checkpoints \
-  --output-dir outputs/train/wm3d_wam_k16_r4/stage_b_main_gpu1_4
+  --initialize-from outputs/train/wm3d_wam_k16_r5/stage_b_warmup_gpu1_4/checkpoints \
+  --output-dir outputs/train/wm3d_wam_k16_r5/stage_b_main_gpu1_4
 ```
 
 main 解冻 Wan VideoDiT 和 VGGT deep，继续训练 Action Expert、WM3D core 与
-geometry adapters。
+geometry adapters。默认 route mix 为 `forward_world=0.65`、`action_only=0.25`、
+`joint_world_action=0.10`，使多数更新直接学习 clean action-conditioned RGB。
+`action_only` 的视频/VGGT conditioner 在 no-grad 区域构建；`joint_world_action`
+只允许 video→action，不允许视频读取 noisy action。
 
-四卡 main canary 必须至少覆盖 `forward_world`、`joint_world_action` 和
-`action_only`，并通过一次完整 rank-local checkpoint；仅成功构建模型不算通过
-显存门禁。
+单卡 full-pipeline canary 必须分别覆盖 `forward_world`、
+`joint_world_action` 和 `action_only` 的真实 forward/backward 与梯度归属；四卡 main
+canary 还必须完成真实 FSDP optimizer step 和完整 rank-local checkpoint。仅成功构建
+模型不算通过显存门禁。
 
 ### 7.4 Stage C：tri-stream alignment，20,000 步
 
@@ -207,8 +216,8 @@ geometry adapters。
   --validation-samples-per-rank 8 \
   --checkpoint-interval 500 \
   --keep-last-checkpoints 3 \
-  --initialize-from outputs/train/wm3d_wam_k16_r4/stage_b_main_gpu1_4/checkpoints \
-  --output-dir outputs/train/wm3d_wam_k16_r4/stage_c_tri_stream_gpu1_4
+  --initialize-from outputs/train/wm3d_wam_k16_r5/stage_b_main_gpu1_4/checkpoints \
+  --output-dir outputs/train/wm3d_wam_k16_r5/stage_c_tri_stream_gpu1_4
 ```
 
 Stage B warmup、main 和 Stage C 必须保持相同的有序四卡 mesh（物理 1、2、3、4）。学习率和参数归属
@@ -233,8 +242,8 @@ Stage B warmup、main 和 Stage C 必须保持相同的有序四卡 mesh（物�
   --validation-samples-per-rank 8 \
   --checkpoint-interval 500 \
   --keep-last-checkpoints 3 \
-  --resume outputs/train/wm3d_wam_k16_r4/stage_a_world_core_gpu1_4/checkpoints \
-  --output-dir outputs/train/wm3d_wam_k16_r4/stage_a_world_core_gpu1_4
+  --resume outputs/train/wm3d_wam_k16_r5/stage_a_world_core_gpu1_4/checkpoints \
+  --output-dir outputs/train/wm3d_wam_k16_r5/stage_a_world_core_gpu1_4
 ```
 
 `--stop-after-step N` 在 phase-local step N 验证、保存完整 checkpoint，并写

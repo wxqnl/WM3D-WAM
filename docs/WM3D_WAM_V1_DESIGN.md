@@ -1,11 +1,11 @@
 # WM3D-WAM v1 完整设计
 
-版本：Revision 4
+版本：Revision 5
 
-日期：2026-08-21
+日期：2026-08-23
 
-状态：Stage A 四卡正式训练已完成；Stage B 四卡真实训练、验证与 checkpoint
-canary 已通过并开始正式训练
+状态：Revision 4 正式训练已停止并保留；Revision 5 结构修复已通过完整测试、真实
+单卡三 route backward、四卡 Stage A/Stage B FSDP 与 checkpoint 门禁
 
 ## 1. 设计结论
 
@@ -38,7 +38,7 @@ K=16 统一的是世界状态、时间边界和视频目标。它不把所有数
 | VGGT | 在线编码观测、提供在线监督、传播深层几何 | 不预测策略动作 |
 | Wan2.2 Video Expert | 预测未来 RGB latent flow | 不承担 grouped action decoder |
 | Grouped ActionDiT | 预测 source-native grouped action flow | 不承担 RGB decoder |
-| Wan/Action MoT | 让视频和动作专家逐层交换信息 | 不改变两种输出的所有权 |
+| Wan/Action MoT | 按 route 执行有方向的逐层 mixed attention | 不让 noisy action 反向污染 RGB |
 
 这份职责划分解决了旧方案中的两个混淆。第一，Geometry-GAM 不是 world model
 core；新的 Stage A 直接训练 WM3D 世界状态。第二，动作没有绕开 Wan 能力。
@@ -230,6 +230,12 @@ Grouped Action Expert 有 30 层、hidden 1024、FFN 4096。Action codec 不把�
 压成一个固定 7D 向量，而是保留最多 8 个 group、每组 16 个标量及其语义 mask。
 输出 velocity 与 grouped action tensor 同 shape。
 
+每个物理标量先将 `value feature` 与 joint/axis/semantic/group/dimension field
+metadata 拼接并经过非线性 `phi(value, field)`，再进行 masked set pooling。禁止先做
+`value_encoder(value) + field_metadata` 后直接求和：该写法对不同字段之间的数值
+置换严格不敏感，会把 x/y、不同关节或 gripper 值编码为同一个 token。state history
+codec 使用同一字段—数值绑定合同。
+
 Action Expert 的通用 transformer 权重由 Wan2.2 初始化。shape 一致的 tensor
 直接迁移，shape 不一致的 tensor 使用 FastWAM 的逐维线性插值和 alpha scaling。
 grouped codec 与输出层单独初始化。
@@ -239,20 +245,32 @@ grouped codec 与输出层单独初始化。
 Wan 和 Action Expert 在每一层分别生成 Q/K/V，随后执行一次受 interaction mask
 约束的 mixed attention，再回到各自 projection 和 FFN。action-only 部署使用
 observed-video K/V prefill；训练调用同一 cache 路径。动作因此持续读取 Wan 的
-视觉表征，同时保留适合 robot control 的输出 ABI。
+视觉表征，同时保留适合 robot control 的输出 ABI。action-only loss 只更新 Action
+Expert；Wan、VGGT 和 world-state conditioner 在该 route 中是 detached 条件，避免
+policy-only 样本把视频生成器推向静态捷径。
+
+`forward_world` 使用 clean factual action 条件 RGB。16 个 0.1 秒物理 action bin
+按照 `future_action_history.step_indices` 精确映射到四个未来 Wan latent group；anchor
+不读 future action，第 q 个未来 latent group 只读本组 action。该 mask 对齐 FastWAM
+正式配置的 `action_group_causal_mask_mode=group_diagonal`，同时不假设每组 event
+数量相等或数据源 action rate。
+
+`joint_world_action` 遵循成熟 FastWAM 的 joint 方向：noisy video 可以为 action
+提供上下文，video 不读取 noisy action。它同时优化两个 flow，但不是双向泄漏。
 
 ## 8. 四种训练 route
 
-| route | future action 输入 | future video 输入 | 输出与损失 |
-|---|---|---|---|
-| world_core_pretrain | clean factual | clean RGB 仅作 detached target | factual shallow、action-free shallow、geometry |
-| action_only | noisy action | current RGB anchor | action flow |
-| forward_world | clean factual | noisy 17-frame latent | video flow、factual shallow、geometry |
-| joint_world_action | noisy action | noisy 17-frame latent | action flow、video flow、action-free shallow |
+| route | future action 输入 | future video 输入 | 跨流方向 | 输出与损失 |
+|---|---|---|---|---|
+| world_core_pretrain | clean factual | clean RGB 仅作 detached target | 不加载 MoT | factual shallow、action-free shallow、geometry |
+| action_only | noisy action | current RGB anchor | video→action cache | action flow；只更新 Action Expert |
+| forward_world | clean factual | noisy 17-frame latent | group-diagonal action→video | video flow、factual shallow、geometry |
+| joint_world_action | noisy action | noisy 17-frame latent | video→action | action flow、video flow、action-free shallow |
 
 三个 MoT route 使用独立的严格 attention mask。target RGB 永远不进入 action-only
 policy graph。cache parity 和 target-leakage 测试要求两条部署等价路径输出完全
-一致。
+一致。Stage B warmup/main 的默认采样比例为 `action_only=0.25`、
+`forward_world=0.65`、`joint_world_action=0.10`；Stage C 为 0.20/0.60/0.20。
 
 ## 9. 损失
 
@@ -319,14 +337,14 @@ contract 定义的原生事件时刻和 group 语义。
 ### 12.2 forward-world
 
 输入 observed RGB、机器人历史、任务和给定未来动作。factual dynamics 生成动作
-条件世界状态，Wan 对五个 future latent position 去噪并解码 17 帧 RGB。VGGT
+条件世界状态，Wan 对四个 future latent group 去噪并解码 17 帧 RGB。VGGT
 geometry 可作为 rollout 诊断输出。
 
 ### 12.3 joint rollout
 
-动作和视频同时从 noise 开始，在 MoT 中双向交互。world state 使用 action-free
-prior，避免把尚未完成的 noisy action 当事实动力学。联合采样器可在每轮 denoise
-后更新两个流。
+动作和视频同时从 noise 开始；视频流保持自回归/文本/几何条件，动作流逐层读取
+当前 noisy video 表征。world state 使用 action-free prior，避免把尚未完成的 noisy
+action 当事实动力学。联合采样器可在每轮 denoise 后更新两个流。
 
 ## 13. 已验证门禁
 
@@ -335,19 +353,28 @@ prior，避免把尚未完成的 noisy action 当事实动力学。联合采样�
 - WM3D core shape、action-free invariance 和 state/dynamics/decoder 梯度通过；
 - 真实 DROID world-core forward/backward 和所有梯度 owner 通过；
 - 真实 RoboCasa action-only cache parity 与 future-target leakage delta 均为 0；
-- 单卡 forward-world 与 joint route 的 Wan、Action、VGGT、WM3D 梯度通过；
-- 四卡 world-core 正式训练完成，full-model train、validation 和 rank-local
-  checkpoint canary 通过。
+- grouped action/state codec 对 x/y、关节和字段间 value swap 均敏感；
+- 16 个物理 action bin 到四个 future latent group 的 group-diagonal mask 通过；
+- 单卡三 route 真实 backward 的梯度归属通过，action-only 对 Wan/VGGT/WM3D 梯度
+  为 0；
+- 四卡 Revision 5 world-core 完成两个真实 optimizer step 和 canonical DCP；
+- 四卡 Revision 5 full model 的最终 group-diagonal 路径完成一个真实
+  `forward_world` optimizer step 和完整 rank-local checkpoint，峰值约 68.5 GiB；
+  action-only/joint 的最终梯度归属由单卡 full-model backward 覆盖。
 
 这些门禁证明 pipeline 可训练，不证明下游任务成功率。策略质量、长 rollout
 稳定性和 OOD 泛化必须在正式 checkpoint 上独立评测。
 
 ## 14. 迁移规则
 
-旧 `geometry_gam` step-1000 checkpoint 的 predictor 和动作头与新 WM3D core
-参数空间不同，不能作为精确 resume，也不能宣称已经训练了新 world model。
-Revision 4 从官方 VGGT 权重和新初始化的 WM3D core 开始新的 Stage A。后续阶段
-只允许从 Revision 4 的完成 checkpoint 初始化。
+Revision 4 的 grouped state/action codec 在 set pooling 前将 value feature 与 field
+metadata 相加，导致字段间 value swap 不改变 token；同时旧 MoT route 使用了过宽的
+action→video 可见性。其 checkpoint 文件仍完整保留，但这些权重不能 resume
+Revision 5，也不能作为 Revision 5 后续阶段初始化点。
+
+Revision 5 从官方 VGGT 权重和新初始化的 WM3D core 重新开始 Stage A。后续阶段只
+允许从同一 revision 的完整 checkpoint 初始化。`geometry_gam` 等更早 checkpoint
+同样不兼容。
 
 ## 15. 最终回答
 

@@ -181,6 +181,8 @@ class WM3DWAMSystem(nn.Module):
             action_timestep=action_timestep,
             context=context,
             context_mask=context_mask,
+            action_step_indices=window.future_action_history.step_indices,
+            num_action_steps=window.future_action_history.num_steps,
             geometry_tokens=geometry.geometry_tokens,
             geometry_token_mask=geometry.geometry_token_mask,
         )

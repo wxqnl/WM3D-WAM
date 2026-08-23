@@ -27,8 +27,10 @@ does not require a VGGT, depth, point, pose, or Wan-latent cache.
 - Trainable VGGT pairs 4–23 resume at 0.4/0.8/1.2/1.6-second anchors and produce
   geometry tokens for Wan/Action attention.
 - Wan2.2 owns RGB velocity prediction. Grouped ActionDiT owns action velocity
-  prediction. The two experts exchange information through mixed attention at
-  every transformer layer.
+  prediction. They reuse FastWAM's mixed-attention layers with route-specific
+  directionality: clean, time-aligned actions causally condition RGB in
+  `forward_world`, while observed/noisy video conditions action prediction in
+  `action_only` and `joint_world_action`.
 
 GAM is not the world-model core and has no active policy or action head in the
 factory graph. The repository keeps its vendored VGGT adapter as implementation
@@ -50,11 +52,13 @@ The active routes are:
 - `world_core_pretrain`: factual world rollout with online feature and geometry
   supervision; Wan and ActionDiT are not loaded;
 - `action_only`: action flow from the observed frame, task, robot history, and
-  action-free world state;
+  action-free world state; the action loss cannot update Wan or VGGT;
 - `forward_world`: video flow and factual world dynamics conditioned on clean
-  recorded actions;
-- `joint_world_action`: coupled action/video flow with an action-free world
-  state, which prevents clean future-action leakage.
+  recorded actions through an exact group-diagonal mapping from 16 physical bins
+  to four future Wan latent groups;
+- `joint_world_action`: video and action flow are trained together, but video
+  cannot read noisy action tokens; video supplies context to action, matching
+  mature FastWAM joint directionality and preventing target leakage.
 
 ## Repository layout
 

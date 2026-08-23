@@ -15,6 +15,7 @@ from wm3d_wam.data.grouped_robot import (
     panda_single_arm_spec,
 )
 from wm3d_wam.models.grouped_action_flow import (
+    GroupedActionCodec,
     GroupedActionCodecConfig,
     GroupedActionFlowExpert,
     grouped_action_flow_loss,
@@ -80,6 +81,34 @@ def test_grouped_action_expert_runs_real_action_dit_blocks_and_backpropagates() 
     loss.backward()
     assert expert.blocks[0].self_attn.q.weight.grad is not None
     assert expert.codec.value_encoder[0].weight.grad is not None
+
+
+def test_grouped_action_codec_preserves_value_field_association() -> None:
+    torch.manual_seed(29)
+    batch = _batch(rates=(10,), max_events=16)
+    codec = GroupedActionCodec(
+        GroupedActionCodecConfig(
+            hidden_dim=32,
+            max_groups=8,
+            max_action_dim=16,
+            time_fourier_dim=16,
+        )
+    )
+    original = codec.encode(batch)
+    swapped_values = batch.values.clone()
+    valid_fields = torch.nonzero(batch.value_mask[0, 0], as_tuple=False)
+    assert valid_fields.shape[0] >= 2
+    first_group, first_dim = valid_fields[0].tolist()
+    second_group, second_dim = valid_fields[1].tolist()
+    first = swapped_values[0, 0, first_group, first_dim].clone()
+    second = swapped_values[0, 0, second_group, second_dim].clone()
+    assert not torch.equal(first, second)
+    swapped_values[0, 0, first_group, first_dim] = second
+    swapped_values[0, 0, second_group, second_dim] = first
+
+    swapped = codec.encode(batch.with_values(swapped_values))
+    maximum_delta = (original[:, 0] - swapped[:, 0]).abs().max()
+    assert maximum_delta > 1.0e-4
 
 
 def test_flow_loss_normalizes_each_sample_by_its_valid_scalar_count() -> None:

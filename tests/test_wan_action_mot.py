@@ -92,6 +92,32 @@ def test_action_only_runs_through_wan_mot_and_omits_video_decoder() -> None:
     assert not output.action_velocity[0, 2:].any()
 
 
+def test_action_only_does_not_update_wan_conditioner() -> None:
+    torch.manual_seed(13)
+    model = _model().train()
+    batch = _batch(max_events=8)
+    observed_latents = torch.randn(2, 4, 1, 2, 2, requires_grad=True)
+    context = torch.randn(2, 5, 12)
+
+    output = model(
+        program=InteractionProgram.ACTION_ONLY,
+        video_latents=observed_latents,
+        video_timestep=torch.zeros(2),
+        action_batch=batch,
+        action_timestep=torch.tensor([100.0, 600.0]),
+        context=context,
+        context_mask=torch.ones(2, 5, dtype=torch.bool),
+    )
+    assert output.action_velocity is not None
+    output.action_velocity.square().mean().backward()
+
+    assert observed_latents.grad is None
+    assert all(parameter.grad is None for parameter in model.video_expert.parameters())
+    assert any(
+        parameter.grad is not None for parameter in model.action_expert.parameters()
+    )
+
+
 def test_observed_video_cache_matches_full_action_only_path() -> None:
     torch.manual_seed(17)
     model = _model().eval()

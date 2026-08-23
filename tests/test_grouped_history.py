@@ -10,6 +10,7 @@ from wm3d_wam.models.grouped_action_flow import GroupedActionCodecConfig
 from wm3d_wam.models.grouped_history import (
     GroupedHistoryConnector,
     GroupedHistoryConnectorConfig,
+    GroupedStateHistoryCodec,
 )
 
 
@@ -40,6 +41,51 @@ def test_exact_boundary_events_belong_to_the_following_step():
         step_boundaries_s=torch.tensor([[0.0, 0.5, 1.0, 1.5, 2.0]]),
     )
     assert timeline.step_indices.tolist() == [[0, 1, 2, 3]]
+
+
+def test_grouped_state_codec_preserves_value_field_association():
+    torch.manual_seed(31)
+    values = torch.tensor(
+        [[[[0.25, -0.9, 0.4], [0.1, 0.2, 0.3]]]], dtype=torch.float32
+    )
+    state = GroupedStateHistoryBatch(
+        values=values,
+        value_mask=torch.ones_like(values, dtype=torch.bool),
+        step_mask=torch.ones((1, 1), dtype=torch.bool),
+        times_s=torch.zeros((1, 1)),
+        group_ids=torch.tensor([[1, 2]], dtype=torch.long),
+        group_mask=torch.ones((1, 2), dtype=torch.bool),
+        state_semantic_ids=torch.tensor(
+            [[[1, 2, 3], [4, 5, 6]]], dtype=torch.long
+        ),
+        embodiment_ids=torch.ones((1,), dtype=torch.long),
+    )
+    codec = GroupedStateHistoryCodec(
+        GroupedHistoryConnectorConfig(
+            d_model=32,
+            max_groups=2,
+            max_state_dim=3,
+            time_fourier_dim=16,
+            transformer_depth=1,
+            num_heads=4,
+        )
+    )
+    original = codec(state)
+    swapped_values = values.clone()
+    swapped_values[0, 0, 0, 0] = values[0, 0, 0, 1]
+    swapped_values[0, 0, 0, 1] = values[0, 0, 0, 0]
+    swapped_state = GroupedStateHistoryBatch(
+        values=swapped_values,
+        value_mask=state.value_mask,
+        step_mask=state.step_mask,
+        times_s=state.times_s,
+        group_ids=state.group_ids,
+        group_mask=state.group_mask,
+        state_semantic_ids=state.state_semantic_ids,
+        embodiment_ids=state.embodiment_ids,
+    )
+    swapped = codec(swapped_state)
+    assert (original - swapped).abs().max() > 1.0e-4
 
 
 def test_connector_uses_early_grouped_state_and_action_history():

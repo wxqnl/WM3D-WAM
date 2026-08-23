@@ -347,14 +347,14 @@ def _program_mix(phase: str) -> dict[str, float]:
         TrainingStage.WAN_ACTION_MAIN.value,
     }:
         return {
-            "action_only": 0.50,
-            "forward_world": 0.30,
-            "joint_world_action": 0.20,
+            "action_only": 0.25,
+            "forward_world": 0.65,
+            "joint_world_action": 0.10,
         }
     return {
-        "action_only": 0.40,
-        "forward_world": 0.30,
-        "joint_world_action": 0.30,
+        "action_only": 0.20,
+        "forward_world": 0.60,
+        "joint_world_action": 0.20,
     }
 
 

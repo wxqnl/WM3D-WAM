@@ -14,6 +14,7 @@ from wm3d_wam.vendor.fastwam.wan22.wan_video_dit import WanVideoDiT
 
 from .grouped_action_flow import GroupedActionFlowExpert
 from .geometry_adapters import SparseGeometryKVAdapters
+from .interaction_masks import build_group_diagonal_video_to_action_visibility
 from .interaction_masks import InteractionProgram, build_mot_attention_mask
 
 
@@ -122,15 +123,23 @@ class WanActionMoT(nn.Module):
         action_timestep: torch.Tensor,
         context: torch.Tensor,
         context_mask: Optional[torch.Tensor],
+        detach_video_conditioning: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        video_state = self.video_expert.pre_dit(
-            x=video_latents,
-            timestep=video_timestep,
-            context=context,
-            context_mask=context_mask,
-            action=None,
-            fuse_vae_embedding_in_latents=True,
-        )
+        def prepare_video() -> dict[str, Any]:
+            return self.video_expert.pre_dit(
+                x=video_latents,
+                timestep=video_timestep,
+                context=context,
+                context_mask=context_mask,
+                action=None,
+                fuse_vae_embedding_in_latents=True,
+            )
+
+        if detach_video_conditioning:
+            with torch.no_grad():
+                video_state = prepare_video()
+        else:
+            video_state = prepare_video()
         action_state = self.action_expert.pre_dit(
             action_batch=action_batch,
             timestep=action_timestep,
@@ -272,6 +281,8 @@ class WanActionMoT(nn.Module):
         context_mask: Optional[torch.Tensor] = None,
         video_token_mask: Optional[torch.Tensor] = None,
         video_to_action_visibility: Optional[torch.Tensor] = None,
+        action_step_indices: Optional[torch.Tensor] = None,
+        num_action_steps: Optional[int] = None,
         geometry_tokens: Optional[torch.Tensor] = None,
         geometry_token_mask: Optional[torch.Tensor] = None,
     ) -> WanActionOutput:
@@ -290,6 +301,7 @@ class WanActionMoT(nn.Module):
             action_timestep=action_timestep,
             context=context,
             context_mask=context_mask,
+            detach_video_conditioning=mode is InteractionProgram.ACTION_ONLY,
         )
         if mode is InteractionProgram.ACTION_ONLY and int(
             video_state["meta"]["grid_size"][0]
@@ -307,12 +319,15 @@ class WanActionMoT(nn.Module):
             video_state["tokens"], video_token_mask
         )
         if mode is InteractionProgram.ACTION_ONLY:
-            cache = self._prefill_prepared_video(
-                state=video_state,
-                token_mask=video_mask,
-                geometry_tokens=geometry_tokens,
-                geometry_token_mask=geometry_token_mask,
-            )
+            # Policy-only optimization treats Wan/VGGT as immutable
+            # conditioners; only the action expert receives this loss.
+            with torch.no_grad():
+                cache = self._prefill_prepared_video(
+                    state=video_state,
+                    token_mask=video_mask,
+                    geometry_tokens=geometry_tokens,
+                    geometry_token_mask=geometry_token_mask,
+                )
             action_velocity = self._action_velocity_from_prepared_cache(
                 state=action_state,
                 action_batch=action_batch,
@@ -324,6 +339,22 @@ class WanActionMoT(nn.Module):
                 video_pre_state=video_state,
                 action_pre_state=action_state,
             )
+        if mode is InteractionProgram.FORWARD_WORLD and video_to_action_visibility is None:
+            if action_step_indices is None or num_action_steps is None:
+                raise ValueError(
+                    "forward_world requires physical action step assignments"
+                )
+            video_to_action_visibility = build_group_diagonal_video_to_action_visibility(
+                action_step_indices=action_step_indices,
+                action_event_mask=action_batch.event_mask,
+                video_length=int(video_state["tokens"].shape[1]),
+                video_tokens_per_frame=int(video_state["meta"]["tokens_per_frame"]),
+                num_action_steps=int(num_action_steps),
+            )
+        elif mode is InteractionProgram.JOINT_WORLD_ACTION and (
+            video_to_action_visibility is not None
+        ):
+            raise ValueError("joint_world_action cannot condition video on noisy actions")
         video_self = self.video_expert.build_video_to_video_mask(
             video_seq_len=int(video_state["tokens"].shape[1]),
             video_tokens_per_frame=int(video_state["meta"]["tokens_per_frame"]),

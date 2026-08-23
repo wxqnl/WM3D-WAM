@@ -49,7 +49,7 @@ stages:
     full_phase_memory_canary: passed
     warmup_steps: 2000
     main_steps: 38000
-    program_mix: {action_only: 0.5, forward_world: 0.3, joint_world_action: 0.2}
+    program_mix: {action_only: 0.25, forward_world: 0.65, joint_world_action: 0.10}
     parameter_stages:
       warmup: wan_action_warmup
       main: wan_action_main
@@ -60,4 +60,4 @@ stages:
     gradient_accumulation_steps: 1
     effective_global_batch: 4
     rejected_gradient_accumulation_steps: 4
-    program_mix: {action_only: 0.4, forward_world: 0.3, joint_world_action: 0.3}
+    program_mix: {action_only: 0.20, forward_world: 0.60, joint_world_action: 0.20}

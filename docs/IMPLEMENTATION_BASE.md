@@ -2,10 +2,10 @@
 
 | 项目 | 内容 |
 |---|---|
-| 日期 | 2026-08-20 |
-| 分支 | `codex/implement-wm3d-wam-v1` |
-| 设计版本 | Revision 4，WM3D core + K=16 |
-| 训练机器 | New-H100-2，物理 GPU 1–7 |
+| 日期 | 2026-08-23 |
+| 分支 | `v1` |
+| 设计版本 | Revision 5，WM3D core + K=16 + motion-conditioning fix |
+| 训练机器 | New-H100-2，物理 GPU 1–4 |
 | 数据合同 | `configs/data/grouped_robot_v1.yaml`、`configs/data/source_contracts_v1.yaml` |
 | 模型合同 | `configs/model/vggt_geometry_v1.yaml`、`configs/model/wan_action_mot_v1.yaml` |
 | 训练合同 | `configs/train/wm3d_wam_v1.yaml` |
@@ -37,7 +37,8 @@ raw observed RGB
          -> per-view shallow decoder
     -> trainable VGGT pairs 4-23 at four anchors
     -> reduced geometry K/V
-    -> Wan2.2 Video Expert <-> Grouped Action Expert
+    -> Wan2.2 Video Expert <- clean grouped action (forward_world)
+    -> Wan2.2 Video Expert -> Grouped Action Expert (action/joint)
          -> RGB velocity
          -> grouped action velocity
 ```
@@ -77,8 +78,14 @@ resume 和 geometry reduction。所有 16 步有 shallow supervision；0.4、0.8
 编码，clean target tensor 始终 detach。
 
 `src/wm3d_wam/models/wan_action_mot.py` 保留 30 层 Wan Video Expert 与 30 层
-Grouped Action Expert。两个 expert 每层共享 mixed attention，动作输出仍遵守
-grouped robot ABI。geometry 在五层稀疏注入。
+Grouped Action Expert。两个 expert 复用逐层 mixed attention，但 route 方向显式受
+mask 约束：`forward_world` 用 16→4 group-diagonal clean action→video，
+`action_only`/joint 用 video→action，noisy action 不进入 RGB query。动作输出仍遵守
+grouped robot ABI，geometry 在五层稀疏注入。
+
+grouped state/action codec 在 pooling 前通过非线性 `phi(value, field)` 绑定数值和
+轴/关节语义，避免字段间数值置换被错误编码成同一个 token。action-only 的 frozen
+conditioner 在 no-grad 路径构建，因此 policy loss 只更新 Action Expert。
 
 ## 训练与恢复
 
@@ -94,8 +101,10 @@ checkpointing、cosine schedule、validation、编号 checkpoint 和已提交 sa
 cursor。world-core checkpoint 使用 canonical DCP。完整模型使用 rank-local shard，
 恢复时校验有序 GPU mesh、micro-batch 和 gradient accumulation。
 
-七卡 K=16 world-core 的正式安全值是 micro-batch 4、accumulation 1、global batch
-28。batch 6 曾通过一步但板卡占用接近 80GB；batch 8 OOM，因此配置不会使用它们。
+四卡 K=16 world-core 的正式值是 micro-batch 4、accumulation 1、global batch 16。
+完整 Wan/Action 使用 micro-batch 1、accumulation 1、global batch 4，最终
+group-diagonal FSDP canary 峰值约 68.53 GiB。完整模型 accumulation 4 会因 gradient
+shard 与下一轮 all-gather 并存而 OOM，因此禁止使用。
 
 ## 本地资产
 
@@ -111,7 +120,8 @@ cursor。world-core checkpoint 使用 canonical DCP。完整模型使用 rank-lo
 
 ## 当前边界
 
-新架构已完成 CPU contract、真实数据单卡所有 route、七卡 world-core train/
-validation/checkpoint 门禁。旧 Geometry-GAM 正式 checkpoint 与新 core 不兼容，
-不会继续 resume。完整 Wan/Action 的 K=16 七卡分布式 canary 要在进入对应阶段前
-重新执行；旧架构的 Stage B/C canary 不能替代这项门禁。
+Revision 5 已完成 75 项测试、真实单卡三 route backward、四卡 world-core DCP 和
+最终 group-diagonal full-model optimizer/checkpoint 门禁。Revision 4 的 Stage A/B
+权重因 codec 参数空间和 attention 语义改变而不兼容，只保留作审计证据；Revision 5
+从基础权重重新训练 Stage A。正式 checkpoint 上的 motion ratio、field-swap
+sensitivity 和 held-out RGB demo 仍是训练中的质量门禁。

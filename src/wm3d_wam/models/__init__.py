@@ -17,6 +17,7 @@ from .grouped_history import (
     GroupedHistoryConnectorConfig,
     GroupedStateHistoryCodec,
 )
+from .interaction_masks import build_group_diagonal_video_to_action_visibility
 from .interaction_masks import InteractionProgram, build_mot_attention_mask
 from .online_vggt_geometry import (
     GeometryConditionMode,
@@ -55,6 +56,7 @@ __all__ = [
     "WM3DStateDynamicsCore",
     "WM3DStateDynamicsOutput",
     "build_online_geometry_core",
+    "build_group_diagonal_video_to_action_visibility",
     "build_mot_attention_mask",
     "build_wan_action_mot",
     "load_yaml_mapping",
