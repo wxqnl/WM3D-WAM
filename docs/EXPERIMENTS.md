@@ -191,7 +191,8 @@ Revision 4 的 RGB demo 出现明显静态偏置。对 active graph 与 FastWAM/
 
 修复内容：
 
-- 使用非线性 `phi(value, field)` 后再 masked pooling，恢复 field/value 绑定；
+- 在 rank-32 空间计算并汇聚 `tanh(value) * field_basis`，每个 event 只做一次
+  32→hidden lift；恢复 field/value 绑定，同时避免逐标量 hidden-size 交互；
 - 根据真实 `step_indices` 构造 16→4 group-diagonal action mask，对齐 FastWAM 正式
   配置且不假设各 source 的 event 数量相同；
 - joint 改为 video→action，action-only conditioner 完全 detached；
@@ -199,7 +200,7 @@ Revision 4 的 RGB demo 出现明显静态偏置。对 active graph 与 FastWAM/
 
 ### 8.1 自动与单卡真实门禁
 
-完整测试为 75 项全部通过。真实单卡 full-pipeline preflight 使用在线 VGGT、Wan
+完整测试为 77 项全部通过。真实单卡 full-pipeline preflight 使用在线 VGGT、Wan
 VAE/VideoDiT、Grouped ActionDiT 和实际机器人窗口：
 
 | route | 结果 | peak memory |
@@ -214,15 +215,23 @@ VAE/VideoDiT、Grouped ActionDiT 和实际机器人窗口：
 
 | canary | optimizer steps | checkpoint | peak memory |
 |---|---:|---|---:|
-| Stage A world core | 2 | canonical DCP 完整 | 40.79 GiB |
-| Stage B main（final group-diagonal） | 1 `forward_world` | model/optimizer/runtime rank 000–003 完整 | 68.53 GiB |
+| Stage A world core（low-rank field binding） | 10 | canonical DCP 完整 | 51.62 GiB |
+| Stage B main（final group-diagonal） | 1 `forward_world` | model/optimizer/runtime rank 000–003 完整 | 68.27 GiB |
 
 此前三步 full-model canary 已覆盖两个 `forward_world` 和一个 `action_only`；最终
-group-diagonal mask 另行重跑了一个真实 `forward_world` optimizer step。两次的
+low-rank codec 与 group-diagonal mask 组合另行重跑了一个真实 `forward_world`
+optimizer step。两次的
 loss、grad norm 均 finite，无 OOM、NCCL、DataLoader、NaN 或临时 checkpoint
 文件。joint 由同一 full model 的单卡真实 backward 覆盖。
 
-因为 codec 参数空间与 attention 语义已经改变，Revision 4 的 Stage A 30k 和
+Stage A 性能 A/B 还定位出一个独立问题：完整模型为释放约 11 GiB 显存而引入的
+UMT5 cache-miss offload 被错误地无差别用于 world-core，且 micro-batch 内逐 prompt
+搬运模型，使 step 2 的 compute time 达到约 30 秒。Stage A 改为冻结 UMT5 常驻，
+同时将一个 micro-batch 的 misses 合并编码；第 3–10 步恢复为 2.04–2.66 秒，step 10
+为 2.08 秒、global 7.70 samples/s。Wan/Action full phases 继续保持 encode 后卸载，
+因此不牺牲其 80 GiB 显存门禁。
+
+因为 codec 计算语义、表征优化轨迹与 attention 合同已经改变，Revision 4 的 Stage A 30k 和
 Stage B 14k checkpoint 均不能继续使用。正式 Revision 5 必须从基础权重重新训练。
 
 另外从正式 sampler 独立抽取 120 个真实 `forward_world` train window：相邻帧 RGB

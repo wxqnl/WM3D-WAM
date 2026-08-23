@@ -190,6 +190,7 @@ class PromptEncoderCache:
         device: torch.device,
         dtype: torch.dtype,
         max_entries: int,
+        offload_after_encode: bool = True,
     ) -> None:
         if components.text_encoder is None or components.tokenizer is None:
             raise TrainerError("frozen text components are incomplete")
@@ -200,7 +201,53 @@ class PromptEncoderCache:
         self.device = device
         self.dtype = dtype
         self.max_entries = int(max_entries)
+        self.offload_after_encode = bool(offload_after_encode)
         self.cache: OrderedDict[str, tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
+        if not self.offload_after_encode:
+            self.components.text_encoder.to(device=self.device)
+
+    def _store(
+        self,
+        key: str,
+        value: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
+        self.cache[key] = value
+        while len(self.cache) > self.max_entries:
+            self.cache.popitem(last=False)
+
+    @torch.no_grad()
+    def _encode_uncached(
+        self,
+        prompts: Sequence[str],
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        if not prompts:
+            return []
+        encoder = self.components.text_encoder
+        # Full Wan/Action phases need the ~11 GiB frozen UMT5 off GPU before
+        # FSDP all-gathers the trainable VideoDiT.  Stage A has no VideoDiT
+        # and keeps UMT5 resident, avoiding a weight round-trip on every new
+        # task string.  In either mode all misses in a micro-batch are encoded
+        # together so the offload path performs at most one round-trip.
+        if self.offload_after_encode:
+            encoder.to(device=self.device)
+        try:
+            context, mask = encode_local_wan_prompts(
+                self.components,
+                list(prompts),
+                device=self.device,
+                dtype=self.dtype,
+            )
+        finally:
+            if self.offload_after_encode:
+                encoder.to(device=torch.device("cpu"))
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+        if context.shape[0] != len(prompts) or mask.shape[0] != len(prompts):
+            raise TrainerError("prompt encoder returned an invalid batch dimension")
+        return [
+            (context[index : index + 1].detach(), mask[index : index + 1].detach())
+            for index in range(len(prompts))
+        ]
 
     @torch.no_grad()
     def encode(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -209,35 +256,30 @@ class PromptEncoderCache:
         if cached is not None:
             self.cache[key] = cached
             return cached
-        encoder = self.components.text_encoder
-        # UMT5 is frozen and its output is detached. Keeping its ~11 GiB of
-        # BF16 weights resident after a cache miss leaves too little room for
-        # the trainable Wan VideoDiT full-parameter all-gather in backward.
-        # Move it onto the rank GPU only for no-grad prompt encoding, then
-        # return it to CPU before the FSDP training graph starts.
-        encoder.to(device=self.device)
-        try:
-            context, mask = encode_local_wan_prompts(
-                self.components,
-                [key],
-                device=self.device,
-                dtype=self.dtype,
-            )
-        finally:
-            encoder.to(device=torch.device("cpu"))
-            if self.device.type == "cuda":
-                torch.cuda.empty_cache()
-        value = (context.detach(), mask.detach())
-        self.cache[key] = value
-        while len(self.cache) > self.max_entries:
-            self.cache.popitem(last=False)
+        value = self._encode_uncached([key])[0]
+        self._store(key, value)
         return value
 
     @torch.no_grad()
     def encode_batch(self, prompts: Sequence[str]) -> tuple[torch.Tensor, torch.Tensor]:
         if not prompts:
             raise TrainerError("prompt micro-batch is empty")
-        encoded = [self.encode(prompt) for prompt in prompts]
+        keys = [prompt.strip() for prompt in prompts]
+        resolved: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        missing: list[str] = []
+        for key in keys:
+            cached = self.cache.pop(key, None)
+            if cached is not None:
+                self.cache[key] = cached
+                resolved[key] = cached
+            elif key not in resolved and key not in missing:
+                missing.append(key)
+        if missing:
+            values = self._encode_uncached(missing)
+            for key, value in zip(missing, values, strict=True):
+                resolved[key] = value
+                self._store(key, value)
+        encoded = [resolved[key] for key in keys]
         return (
             torch.cat([value[0] for value in encoded], dim=0),
             torch.cat([value[1] for value in encoded], dim=0),
@@ -777,6 +819,7 @@ def train(
         device=context.device,
         dtype=dtype,
         max_entries=options.prompt_cache_entries,
+        offload_after_encode=not built.is_geometry_only,
     )
 
     run_description: dict[str, object] = {
@@ -871,13 +914,16 @@ def train(
         accumulated: dict[str, float] = {}
         program_counts: dict[str, int] = {}
         source_counts: dict[str, int] = {}
+        data_wait_seconds = 0.0
         retry_count = 0
         for micro_step in range(options.gradient_accumulation_steps):
+            data_wait_started = time.perf_counter()
             sample = _next_sample_synchronized(
                 train_iterator,
                 context=context,
                 purpose="training",
             )
+            data_wait_seconds += time.perf_counter() - data_wait_started
             # FSDP ``no_sync`` retains full, unsharded gradients until the last
             # micro-step. The 11B Stage-B graph then needs another ~11 GiB on
             # the largest rank and cannot fit on an 80 GiB H100. Synchronizing
@@ -922,6 +968,8 @@ def train(
             {
                 "grad_norm_preclip": grad_norm,
                 "step_seconds": step_seconds,
+                "data_wait_seconds": data_wait_seconds,
+                "compute_seconds": max(0.0, step_seconds - data_wait_seconds),
                 "samples_per_second_global": (
                     context.world_size
                     * options.micro_batch_size

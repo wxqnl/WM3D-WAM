@@ -83,8 +83,9 @@ mask 约束：`forward_world` 用 16→4 group-diagonal clean action→video，
 `action_only`/joint 用 video→action，noisy action 不进入 RGB query。动作输出仍遵守
 grouped robot ABI，geometry 在五层稀疏注入。
 
-grouped state/action codec 在 pooling 前通过非线性 `phi(value, field)` 绑定数值和
-轴/关节语义，避免字段间数值置换被错误编码成同一个 token。action-only 的 frozen
+grouped state/action codec 在 rank-32 空间汇聚 `tanh(value) * field_basis`，再对
+每个 event 做一次 32→hidden lift，从而绑定数值和轴/关节语义，避免字段间数值置换
+被错误编码成同一个 token，且不增加逐标量 hidden-size 交互。action-only 的 frozen
 conditioner 在 no-grad 路径构建，因此 policy loss 只更新 Action Expert。
 
 ## 训练与恢复
@@ -103,7 +104,7 @@ cursor。world-core checkpoint 使用 canonical DCP。完整模型使用 rank-lo
 
 四卡 K=16 world-core 的正式值是 micro-batch 4、accumulation 1、global batch 16。
 完整 Wan/Action 使用 micro-batch 1、accumulation 1、global batch 4，最终
-group-diagonal FSDP canary 峰值约 68.53 GiB。完整模型 accumulation 4 会因 gradient
+group-diagonal FSDP canary 峰值约 68.27 GiB。完整模型 accumulation 4 会因 gradient
 shard 与下一轮 all-gather 并存而 OOM，因此禁止使用。
 
 ## 本地资产
@@ -120,8 +121,8 @@ shard 与下一轮 all-gather 并存而 OOM，因此禁止使用。
 
 ## 当前边界
 
-Revision 5 已完成 75 项测试、真实单卡三 route backward、四卡 world-core DCP 和
+Revision 5 已完成 77 项测试、真实单卡三 route backward、四卡 world-core DCP 和
 最终 group-diagonal full-model optimizer/checkpoint 门禁。Revision 4 的 Stage A/B
-权重因 codec 参数空间和 attention 语义改变而不兼容，只保留作审计证据；Revision 5
+权重因 codec 计算和 attention 语义改变而不兼容，只保留作审计证据；Revision 5
 从基础权重重新训练 Stage A。正式 checkpoint 上的 motion ratio、field-swap
 sensitivity 和 held-out RGB demo 仍是训练中的质量门禁。

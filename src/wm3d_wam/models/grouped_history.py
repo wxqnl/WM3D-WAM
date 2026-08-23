@@ -69,12 +69,9 @@ class GroupedStateHistoryCodec(nn.Module):
         self.value_encoder = nn.Sequential(
             nn.Linear(1, hidden), nn.SiLU(), nn.Linear(hidden, hidden)
         )
-        self.field_value_encoder = nn.Sequential(
-            nn.LayerNorm(2 * hidden),
-            nn.Linear(2 * hidden, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, hidden),
-        )
+        binding_rank = min(32, hidden)
+        self.field_binding_down = nn.Linear(hidden, binding_rank, bias=False)
+        self.field_binding_up = nn.Linear(binding_rank, hidden, bias=False)
         self.semantic_embedding = nn.Embedding(
             config.state_semantic_vocab_size, hidden, padding_idx=0
         )
@@ -141,14 +138,17 @@ class GroupedStateHistoryCodec(nn.Module):
             + self.group_slot_embedding(group_slots)[None, :, None]
             + self.dimension_embedding(dimension_slots)[None, None, :]
         )
-        field_metadata = metadata[:, None].expand(-1, h, -1, -1, -1)
         value_features = self.value_encoder(values.unsqueeze(-1))
-        scalar = self.field_value_encoder(
-            torch.cat((value_features, field_metadata), dim=-1)
-        )
+        scalar = value_features + metadata[:, None]
         weights = valid.unsqueeze(-1).to(dtype=scalar.dtype)
         denominator = weights.sum(dim=(2, 3)).clamp_min(1.0)
         token = (scalar * weights).sum(dim=(2, 3)) / denominator
+        field_basis = torch.tanh(self.field_binding_down(metadata)).unsqueeze(1)
+        compact_binding = field_basis * torch.tanh(values.unsqueeze(-1))
+        compact_binding = (
+            (compact_binding * weights).sum(dim=(2, 3)) / denominator
+        )
+        token = token + self.field_binding_up(compact_binding)
 
         frequency = self.time_frequencies_hz.to(
             device=values.device, dtype=batch.times_s.dtype

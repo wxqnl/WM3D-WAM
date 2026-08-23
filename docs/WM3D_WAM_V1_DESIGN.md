@@ -230,11 +230,13 @@ Grouped Action Expert 有 30 层、hidden 1024、FFN 4096。Action codec 不把�
 压成一个固定 7D 向量，而是保留最多 8 个 group、每组 16 个标量及其语义 mask。
 输出 velocity 与 grouped action tensor 同 shape。
 
-每个物理标量先将 `value feature` 与 joint/axis/semantic/group/dimension field
-metadata 拼接并经过非线性 `phi(value, field)`，再进行 masked set pooling。禁止先做
+codec 保留原有 additive pooled event token，并增加一个紧凑字段绑定 residual：先把
+field metadata 投影到 rank 32，计算 `tanh(value) * field_basis` 后 masked pooling，
+最后每个 event 只执行一次 32→hidden lift。这个低秩双线性交互使字段与数值不可
+分离，但不在每个标量上执行 hidden-size MLP。禁止只做
 `value_encoder(value) + field_metadata` 后直接求和：该写法对不同字段之间的数值
-置换严格不敏感，会把 x/y、不同关节或 gripper 值编码为同一个 token。state history
-codec 使用同一字段—数值绑定合同。
+置换严格不敏感，会把 x/y、不同关节或 gripper 值编码为同一个 token。state
+history codec 使用同一字段—数值绑定合同。
 
 Action Expert 的通用 transformer 权重由 Wan2.2 初始化。shape 一致的 tensor
 直接迁移，shape 不一致的 tensor 使用 FastWAM 的逐维线性插值和 alpha scaling。
@@ -357,9 +359,10 @@ action 当事实动力学。联合采样器可在每轮 denoise 后更新两个�
 - 16 个物理 action bin 到四个 future latent group 的 group-diagonal mask 通过；
 - 单卡三 route 真实 backward 的梯度归属通过，action-only 对 Wan/VGGT/WM3D 梯度
   为 0；
-- 四卡 Revision 5 world-core 完成两个真实 optimizer step 和 canonical DCP；
+- 四卡 Revision 5 world-core 完成十个真实 optimizer step 和 canonical DCP，稳定步
+  2.04–2.66 秒，峰值约 51.62 GiB；
 - 四卡 Revision 5 full model 的最终 group-diagonal 路径完成一个真实
-  `forward_world` optimizer step 和完整 rank-local checkpoint，峰值约 68.5 GiB；
+  `forward_world` optimizer step 和完整 rank-local checkpoint，峰值约 68.27 GiB；
   action-only/joint 的最终梯度归属由单卡 full-model backward 覆盖。
 
 这些门禁证明 pipeline 可训练，不证明下游任务成功率。策略质量、长 rollout
@@ -368,7 +371,7 @@ action 当事实动力学。联合采样器可在每轮 denoise 后更新两个�
 ## 14. 迁移规则
 
 Revision 4 的 grouped state/action codec 在 set pooling 前将 value feature 与 field
-metadata 相加，导致字段间 value swap 不改变 token；同时旧 MoT route 使用了过宽的
+metadata 可分离相加，导致字段间 value swap 不改变 token；同时旧 MoT route 使用了过宽的
 action→video 可见性。其 checkpoint 文件仍完整保留，但这些权重不能 resume
 Revision 5，也不能作为 Revision 5 后续阶段初始化点。
 

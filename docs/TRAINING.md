@@ -94,11 +94,14 @@ rank-local checkpoint 均通过，首步峰值约 68.6 GiB。累积 4 会在后�
 同时保留 FP32 gradient shard 和新一轮 full-parameter all-gather，80 GiB H100
 实测 OOM，因此禁止用于当前四卡 mesh。
 
-冻结的 UMT5 只在 prompt cache miss 时临时进入对应 rank 的 GPU。文本特征产生后，
-encoder 必须立即回到 CPU，并在 FSDP forward/backward 前释放 CUDA allocator cache。
-UMT5 不参与 optimizer 或训练图；若让其约 11 GiB 的 BF16 权重常驻，每卡可用空间
-不足以承载解冻 Wan VideoDiT 后约 11.3 GiB 的 FSDP full-parameter all-gather。
-cache miss step 会包含一次 CPU/GPU 权重搬运，命中已有 prompt 时不再搬运或重新
+冻结的 UMT5 不参与 optimizer 或训练图。Stage A 不加载 Wan VideoDiT，显存门禁允许
+UMT5 常驻对应 rank GPU；同一 micro-batch 的所有 prompt cache miss 合并成一次 batched
+encode，禁止为 batch 内每条文本重复搬运 11 GiB 权重。
+
+Wan/Action full phases 必须在 prompt cache miss 时把 UMT5 临时搬入对应 rank GPU，
+batched encode 完成立即回到 CPU，并在 FSDP forward/backward 前释放 CUDA allocator
+cache。此时若让约 11 GiB 的 UMT5 常驻，每卡可用空间不足以承载解冻 Wan VideoDiT
+后约 11.3 GiB 的 FSDP full-parameter all-gather。命中已有 prompt 时不再搬运或重新
 编码。
 
 ## 6. Checkpoint
@@ -113,8 +116,8 @@ checkpoint 保存 model、optimizer、scheduler、各 rank RNG 和已提交 samp
 只清理更老且带合法完成标记的 checkpoint。
 
 Revision 5 修复了 grouped state/action codec 的字段—数值绑定，并改变了 MoT 的
-跨流 attention 合同。Revision 4 的 Stage A/B checkpoint 虽然文件完整，但参数空间
-和训练语义都已过期，不能 resume 或作为后续阶段初始化点。Revision 5 必须从官方
+跨流 attention 合同。Revision 4 的 Stage A/B checkpoint 虽然文件完整，但 codec
+计算语义和优化轨迹都已过期，不能 resume 或作为后续阶段初始化点。Revision 5 必须从官方
 VGGT/Wan/FastWAM 基础权重重新训练 Stage A；旧输出只保留作审计证据。
 
 `stage_a_geometry`、`geometry_gam` 和更早 checkpoint 同样不包含当前 WM3D state

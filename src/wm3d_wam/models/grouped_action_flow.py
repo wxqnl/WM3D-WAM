@@ -82,17 +82,9 @@ class GroupedActionCodec(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden, hidden),
         )
-        # A field/value pair must be fused before set pooling.  Adding the two
-        # independently and then summing makes the event token invariant to
-        # swapping values between valid fields, which destroys joint/axis
-        # identity.  This is a DeepSets phi(value, field) map: pooling remains
-        # embodiment-agnostic while every scalar keeps its physical meaning.
-        self.field_value_encoder = nn.Sequential(
-            nn.LayerNorm(2 * hidden, eps=self.config.eps),
-            nn.Linear(2 * hidden, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, hidden),
-        )
+        binding_rank = min(32, hidden)
+        self.field_binding_down = nn.Linear(hidden, binding_rank, bias=False)
+        self.field_binding_up = nn.Linear(binding_rank, hidden, bias=False)
         self.semantic_embedding = nn.Embedding(
             self.config.semantic_vocab_size, hidden, padding_idx=0
         )
@@ -250,16 +242,23 @@ class GroupedActionCodec(nn.Module):
             & batch.event_mask[:, :, None, None].to(dtype=torch.bool)
             & batch.group_mask[:, None, :, None].to(dtype=torch.bool)
         )
-        field_metadata = self._field_metadata(batch).unsqueeze(1).expand(
-            -1, batch.values.shape[1], -1, -1, -1
-        )
+        field_metadata = self._field_metadata(batch)
         value_features = self.value_encoder(batch.values.unsqueeze(-1))
-        scalar_tokens = self.field_value_encoder(
-            torch.cat((value_features, field_metadata), dim=-1)
-        )
+        scalar_tokens = value_features + field_metadata.unsqueeze(1)
         scalar_weights = scalar_mask.unsqueeze(-1).to(dtype=scalar_tokens.dtype)
         denominator = scalar_weights.sum(dim=(2, 3)).clamp_min(1.0)
         event_tokens = (scalar_tokens * scalar_weights).sum(dim=(2, 3)) / denominator
+
+        # The additive pooled token above is invariant to swapping values
+        # between fields.  Bind value and field in rank 32, pool that compact
+        # interaction, then lift it once per event.  This keeps the semantic
+        # association without a hidden-size interaction at every scalar.
+        field_basis = torch.tanh(self.field_binding_down(field_metadata)).unsqueeze(1)
+        compact_binding = field_basis * torch.tanh(batch.values.unsqueeze(-1))
+        compact_binding = (
+            (compact_binding * scalar_weights).sum(dim=(2, 3)) / denominator
+        )
+        event_tokens = event_tokens + self.field_binding_up(compact_binding)
 
         time_tokens = self.time_encoder(
             self._time_features(batch.times_s, batch.event_dt_s)
